@@ -174,10 +174,10 @@ python3 tools/questdata_to_sql.py path/to/category_assignments.json
 It stops if the classifier left chains without an LLM answer (run the classifier again
 with `--resume`); `--allow-incomplete` writes the SQL anyway and leaves those quests out.
 
-`tools/classify_quests.py` (Claude) and `tools/classify_quests_codex.py` (Codex CLI) need
-`requests` and either the `anthropic` package with `ANTHROPIC_API_KEY` set or an
-authenticated Codex CLI. They read and write their caches (`wow_quests.json`,
-`quest_chain_cache.json`, `category_assignments.json`) in the folder they run in; those
+`tools/classify_quests.py` asks an authenticated `claude` CLI (`claude --print`). It
+also needs `requests`, the `anthropic` package and `ANTHROPIC_API_KEY` or
+`CLAUDE_CODE_OAUTH_TOKEN` set. It reads and writes its caches (`wow_quests.json`,
+`quest_chain_cache.json`, `category_assignments.json`) in the folder it runs in; those
 are large and kept out of the repository. `tools/expand_chains.py` is the older
 main/side chain expander, kept for reference.
 
