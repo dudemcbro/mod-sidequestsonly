@@ -1,12 +1,13 @@
 -------------------------------------------------------------------------------
--- SideQuestsOnly v2.0.0
+-- SideQuestsOnly v2.1.0
 -- WoW 3.3.5a (WotLK private server)
 --
 -- Adds a coloured category badge to every quest in your quest log,
 -- shows the classification when you pick up a quest at an NPC,
 -- and adds a badge to the quest log detail panel.
 -- Categories: [Story] [Lore] [Attune] [Class] [Profession] [Daily] [PvP] [Holiday] [Event]
---             [Dungeon][Story] [Dungeon][Lore] [Dungeon][Side] [Side] [?]
+--             [Dungeon][Story] [Dungeon][Lore] [Dungeon][Side]
+--             [Raid][Story] [Raid][Lore] [Raid][Side] [Side] [?]
 --
 -- The categories come from the server (mod-sidequestsonly): once loaded, the
 -- addon runs .sqo sync over the AzerothCore addon channel and the server
@@ -20,7 +21,7 @@
 -------------------------------------------------------------------------------
 
 local ADDON   = "SideQuestsOnly"
-local VERSION = "2.0.0"
+local VERSION = "2.1.0"
 local PREFIX  = "SQO"
 
 -- This client uses QuestLogScrollFrameButton1..N instead of QuestLogTitle1..N
@@ -28,7 +29,7 @@ local BUTTON_PREFIX = "QuestLogScrollFrameButton"
 local NUM_BUTTONS   = nil   -- detected lazily when quest log is first open
 
 local BADGE = {
-    intro          = "|cFF5BC0DE[Intro]|r",                             -- Sky blue - level 1-10 race starting zone
+    intro          = "|cFF5BC0DE[Intro]|r",                             -- Sky blue - retired, only in older server data
     story          = "|cFFFFD700[Story]|r",                              -- Gold    - drives zone/expansion narrative
     lore           = "|cFF40C040[Lore]|r",                              -- Green   - world-building, non-critical
     attune         = "|cFFFF8000[Attune]|r",                            -- Orange  - required for raid/dungeon access
@@ -37,10 +38,13 @@ local BADGE = {
     daily          = "|cFF00FFFF[Daily]|r",                             -- Cyan    - repeatable daily
     pvp            = "|cFFFF4040[PvP]|r",                               -- Red     - battleground / Wintergrasp / PvP quest
     holiday        = "|cFFFF69B4[Holiday]|r",                           -- Pink    - seasonal event (Hallow's End, Brewfest, etc.)
-    event          = "|cFFFF9900[Event]|r",                             -- Amber   - world/patch event (Scourge Invasion, AQ War Effort, Argent Tournament)
+    event          = "|cFFFF9900[Event]|r",                             -- Amber   - world/patch event (Scourge Invasion, AQ War Effort)
     dungeon_story  = "|cFF00B0B0[Dungeon]|r|cFFFFD700[Story]|r",       -- Teal+Gold  - dungeon quest with narrative
     dungeon_lore   = "|cFF00B0B0[Dungeon]|r|cFF40C040[Lore]|r",        -- Teal+Green - dungeon quest with lore content
     dungeon_side   = "|cFF00B0B0[Dungeon]|r|cFF888888[Side]|r",        -- Teal+Gray  - dungeon quest, filler content
+    raid_story     = "|cFF4080FF[Raid]|r|cFFFFD700[Story]|r",          -- Blue+Gold  - raid quest with narrative
+    raid_lore      = "|cFF4080FF[Raid]|r|cFF40C040[Lore]|r",           -- Blue+Green - raid quest with lore content
+    raid_side      = "|cFF4080FF[Raid]|r|cFF888888[Side]|r",           -- Blue+Gray  - raid quest, filler content
     side           = "|cFF888888[Side]|r",                              -- Gray    - filler, no narrative value
     unknown        = "|cFF555555[?]|r",                                 -- Dark gray - NPC dialog only; truly unclassified
 }
@@ -92,9 +96,9 @@ local function questIDFromIndex(logIndex)
     end
 end
 
--- Returns the category string ("intro", "story", "lore", "attune", "class",
+-- Returns the category string ("story", "lore", "attune", "class",
 -- "profession", "daily", "pvp", "holiday", "event", "dungeon_story", "dungeon_lore",
--- "dungeon_side", "side")
+-- "dungeon_side", "raid_story", "raid_lore", "raid_side", "side", or the retired "intro")
 -- for a known quest ID, or nil when:
 --   (a) the server's list has not arrived yet, OR
 --   (b) the server has no category for the quest (truly unknown).
@@ -963,7 +967,7 @@ SlashCmdList["SIDEQUESTSONLY"] = function(input)
         local qtype = classify(id)
         if qtype then
             local desc = {
-                intro          = "Race starting zone quest (levels 1-10)",
+                intro          = "Starting zone quest (older server data)",
                 story          = "Drives zone/expansion narrative",
                 lore           = "World-building; optional but meaningful",
                 attune         = "Required for raid/dungeon access",
@@ -972,10 +976,13 @@ SlashCmdList["SIDEQUESTSONLY"] = function(input)
                 daily          = "Repeatable daily quest",
                 pvp            = "Battleground / Wintergrasp / PvP quest",
                 holiday        = "Seasonal event (Hallow's End, Brewfest, etc.)",
-                event          = "World/patch event (Scourge Invasion, AQ War Effort, Argent Tournament)",
+                event          = "World/patch event (Scourge Invasion, AQ War Effort)",
                 dungeon_story  = "Dungeon quest with real narrative",
                 dungeon_lore   = "Dungeon quest with lore content",
                 dungeon_side   = "Dungeon quest - filler content",
+                raid_story     = "Raid quest with real narrative",
+                raid_lore      = "Raid quest with lore content",
+                raid_side      = "Raid quest - filler content",
                 side           = "Filler - no narrative value",
             }
             print(string.format("|cFFFFD700[SQO]|r Quest %d: %s  %s",
@@ -1119,11 +1126,13 @@ SlashCmdList["SIDEQUESTSONLY"] = function(input)
     else
         print("  No quest categories from the server (it needs mod-sidequestsonly).")
     end
-    print("  Categories: " .. BADGE.intro .. " " .. BADGE.story .. " " .. BADGE.lore .. " " ..
+    print("  Categories: " .. BADGE.story .. " " .. BADGE.lore .. " " ..
           BADGE.attune .. " " .. BADGE.class .. " " .. BADGE.profession .. " " ..
           BADGE.daily  .. " " .. BADGE.pvp .. " " .. BADGE.holiday .. " " .. BADGE.event .. " " .. BADGE.side)
     print("  Dungeon: " .. BADGE.dungeon_story .. " " ..
           BADGE.dungeon_lore .. " " .. BADGE.dungeon_side)
+    print("  Raid: " .. BADGE.raid_story .. " " ..
+          BADGE.raid_lore .. " " .. BADGE.raid_side)
     print("  " .. BADGE.unknown .. " = seen but unclassified (NPC dialog only)")
     print(string.format("  |cFF00FF00%d|r quest titles seen.", titles))
     print("  /sqo check  - classify quests in your log")

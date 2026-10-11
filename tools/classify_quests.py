@@ -3,11 +3,12 @@
 classify_quests.py  –  Classify WoW 3.3.5a quests into addon quest categories.
 
 Uses Claude (claude-opus-4-6) as the primary classifier for story / lore / side
-decisions, with rule-based fast-paths for attune, class, profession, daily,
-and dungeon quests.
+decisions, with rules for attune, holiday, event, pvp, class and profession
+quests, and per-quest dungeon, raid and daily tags.
 
-Chains are classified as units: every quest in a chain inherits the chain's
-category, so opening kill/collect quests in story chains get [Story] too.
+Chains share one story / lore / side decision, so opening kill/collect quests
+in story chains get [Story] too. Rules look at single quests: a PvP daily or a
+key quest in a chain does not change the rest of the chain.
 
 Prerequisites:
     pip install requests
@@ -70,93 +71,142 @@ OBJ_MAX_CHARS     = 120          # max chars of objectives per quest
 LARGE_CHAIN_WARN  = 20           # chains this long are flagged for manual review
 # All quests in a chain are sent to the LLM — no sampling cap.
 
-# PvP sort IDs: Alterac Valley, Strand of the Ancients, Arathi Basin, Wintergrasp
-PVP_SORT_IDS = frozenset({2597, 3277, 2677, 4197})
+# QuestInfoID values (QuestInfo.dbc).
+QUEST_INFO_RAID    = frozenset({62, 88, 89})   # Raid, Raid (10), Raid (25)
+QUEST_INFO_DUNGEON = frozenset({81, 85})       # Dungeon, Heroic
+QUEST_INFO_PVP     = 41
 
-# Holiday / seasonal event sort IDs (negative QuestSortID values used for world events).
-# Verified by sampling quests from each sort ID bucket.
-# DK starting area (-372) is excluded here — those become "intro" via STARTING_ZONE_SORT_IDS.
+# Every rule below tags single quests, never whole chains: a chain linked by
+# prev/next can hold a PvP daily or a key quest next to a zone's main story.
+
+# PvP sort IDs: battlegrounds and Wintergrasp.
+PVP_SORT_IDS = frozenset({
+    -25,   # Battlegrounds
+    2597,  # Alterac Valley
+    2839,  # Alterac Valley (subzone)
+    3277,  # Warsong Gulch
+    3358,  # Arathi Basin
+    3820,  # Eye of the Storm
+    4197,  # Wintergrasp
+    4384,  # Strand of the Ancients
+    4710,  # Isle of Conquest
+})
+
+# Holiday / seasonal event sort IDs (negative QuestSortID values, QuestSort.dbc).
 HOLIDAY_SORT_IDS = frozenset({
-    -22,   # Hallow's End + Winter Veil seasonal quests
+    -22,   # Seasonal: Hallow's End, Winter Veil, Harvest Festival
+    -41,   # Day of the Dead
     -364,  # Darkmoon Faire
     -366,  # Lunar Festival (Elders of the Alliance/Horde)
     -369,  # Midsummer Fire Festival
-    -370,  # Brewfest / Hallow's End (additional bucket)
+    -370,  # Brewfest
     -374,  # Noblegarden
     -375,  # Pilgrim's Bounty
     -376,  # Love is in the Air
 })
 
-# World / patch events — one-time server events and major content patches,
-# distinct from recurring calendar holidays.
+# Children's Week shares the "Special" sort (-284) with unrelated quests.
+CHILDRENS_WEEK_QUEST_IDS = frozenset({
+    171, 172, 558, 910, 911, 915, 925, 1468, 1479, 1558, 1687, 1800, 4822,
+    5502, 10942, 10943, 10945, 10950, 10951, 10952, 10953, 10954, 10956,
+    10960, 10962, 10963, 10966, 10967, 10968, 11974, 11975, 13926, 13927,
+    13929, 13930, 13933, 13934, 13937, 13938, 13950, 13951, 13954, 13955,
+    13956, 13957, 13959, 13960, 14441,
+})
+
+# World / patch events: limited-time server events, not annual holidays.
+# The Argent Tournament (-241) is permanent: see NARRATIVE_SORT_OVERRIDES.
 EVENT_SORT_IDS = frozenset({
-    -241,  # Argent Tournament (Icecrown patch content hub)
     -365,  # AQ War Effort (server gate-opening event)
-    -367,  # Argent Dawn commendation signets (Scourge Invasion event)
     -368,  # Scourge Invasion world event
 })
 
-# Class-restricted quest sort IDs — whitelist to avoid false positives.
-# These are class training/unlock quests, class-specific quest hubs, and tier set exchanges.
-# Negative sort_ids are special class quests (Paladin, Warlock, Druid, Shaman, Mage, Warrior).
-# Positive sort_ids are tier set exchanges, epic weapon quests, class-specific hubs.
-# Excludes generic gear vendor exchanges which would otherwise inflate the count.
-CLASS_QUEST_SORT_IDS = frozenset({
-    # Negative sort_ids (special class quests)
-    -81,   # Warrior class quests
-    -82,   # Shaman class quests
-    -61,   # Warlock class quests
-    -141,  # Paladin class quests
-    -161,  # Mage class quests
-    -162,  # Rogue class quests
-    -261,  # Hunter class quests
-    -263,  # Druid class quests
-    # Positive sort_ids (tier set exchanges, epic weapons, class hubs)
-    19,    # Epic weapon quests (Paragons of Power)
-    25,    # Weapon quests / legendary items
-    131,   # Hunter training
-    139,   # Tier/epic quests (Echoes of War)
-    210,   # Icecrown/Argent Citadel (class epic quests)
-    1377,  # Blackrock Mountain epic quests
-    1519,  # Epic item quests
-    1537,  # Tier set exchange (Deliana, Ironforge)
-    1583,  # Epic item quests
-    1584,  # Epic item quests
-    1637,  # Tier set exchange (Mokvar, Orgrimmar)
-    1977,  # Mount quests (class-specific)
-    2159,  # Epic weapon (Quel'Serrar)
-    2557,  # Mage/caster epic items
-    3456,  # Tier/epic set quests
-    3522,  # Bomb Run (class faction combat)
-    4075,  # Quel'Delar epic weapon
-    4080,  # Sunwell epic quests
-    4812,  # Cataclysm class-specific epic
+# Patch 3.0 Zombie Infestation, filed under the "Special" sort (-284).
+EVENT_QUEST_IDS = frozenset({
+    12752, 12753, 12771, 12772, 12773, 12774, 12775, 12776, 12777, 12782,
+    12783, 12784, 12785, 12786, 12787, 12788, 12808, 12809, 12811, 12812,
 })
 
-# Starting zone sort IDs — story chains here become "intro" instead of "story".
-# These are the level 1-10 starting areas for each race.
-STARTING_ZONE_SORT_IDS = frozenset({
-    9,    # Northshire (Human)
-    85,   # Tirisfal Glades / Deathknell (Undead)
-    132,  # Coldridge Valley (Dwarf / Gnome)
-    188,  # Shadowglen / Teldrassil (Night Elf)
-    215,  # Camp Narache (Tauren)
-    220,  # Camp Narache / Mulgore hunt area (Tauren)
-    363,  # Valley of Trials (Orc / Troll)
-    3431, # Sunstrider Isle (Blood Elf)
-    3526, # Ammen Vale / Azuremyst Isle crash site (Draenei)
-    -372, # Ebon Hold (Death Knight)
+# Class quest sort IDs (QuestSort.dbc). Tier set token exchanges are not class
+# quests: they go to the LLM as gear swaps (side).
+CLASS_SORT_IDS = frozenset({
+    -61,   # Warlock
+    -81,   # Warrior
+    -82,   # Shaman
+    -141,  # Paladin
+    -161,  # Mage
+    -162,  # Rogue
+    -261,  # Hunter
+    -262,  # Priest
+    -263,  # Druid
 })
 
-# WoW class names — zone labels that exactly match one of these trigger the
-# rule-based "class" fast-path without needing LLM classification.
-CLASS_NAMES = frozenset({
-    "warrior", "paladin", "hunter", "rogue", "priest",
-    "death knight", "shaman", "mage", "warlock", "druid",
+# Quests that grant a key or an attunement for a dungeon or raid. Only the
+# quest that grants it: the chain leading up to it keeps its own category.
+ATTUNE_QUEST_IDS = frozenset({
+    4742, 4743,         # Seal of Ascension (Upper Blackrock Spire)
+    5505, 5511,         # The Key to Scholomance
+    6502,               # Drakefire Amulet (Onyxia's Lair, Alliance)
+    6602,               # Blood of the Black Dragon Champion (Onyxia's Lair, Horde)
+    7487, 7848,         # Attunement to the Core (Molten Core)
+    7761,               # Blackhand's Command (Blackwing Lair)
+    9121, 9122, 9123, 9378,  # The Dread Citadel - Naxxramas
+    9837,               # Return to Khadgar (The Master's Key, Karazhan)
+    10277,              # The Caverns of Time (Old Hillsbrad Foothills)
+    10297,              # The Opening of the Dark Portal (The Black Morass)
+    10445, 13432,       # The Vials of Eternity (Hyjal Summit)
+    10459, 10558, 10559, 10560, 10561,  # Revered Among ... (heroic keys)
+    10704,              # How to Break Into the Arcatraz
+    10758, 10764,       # Hotter than Hell (Shattered Halls key)
+    10883, 10884, 10885, 10886,  # The Tempest Key, Trial of the Naaru (Tempest Keep)
+    10888, 11116, 13430,  # Trial of the Naaru: Magtheridon
+    10901, 13431,       # The Cudgel of Kar'desh (Serpentshrine Cavern)
+    10985, 13429,       # A Distraction for Akama (Black Temple)
+    13372, 13375,       # The Key to the Focusing Iris (The Eye of Eternity)
+    13607, 13816,       # The Celestial Planetarium (Algalon, Ulduar)
 })
+
+# Raid instance sort IDs. Quests the game types as raid quests
+# (QUEST_INFO_RAID) are raid quests wherever they are filed.
+RAID_SORT_IDS = frozenset({
+    19, 1977,    # Zul'Gurub
+    2159,        # Onyxia's Lair
+    2562,        # Karazhan
+    2677,        # Blackwing Lair
+    2717,        # Molten Core
+    3428,        # Ahn'Qiraj Temple
+    3429,        # Ruins of Ahn'Qiraj
+    3456,        # Naxxramas
+    3606,        # Hyjal Summit
+    3607,        # Serpentshrine Cavern
+    3805,        # Zul'Aman
+    3836,        # Magtheridon's Lair
+    3840, 3959,  # Black Temple
+    3923,        # Gruul's Lair
+    4273,        # Ulduar
+    4493,        # The Obsidian Sanctum
+    4500,        # The Eye of Eternity
+    4603,        # Vault of Archavon
+    4722,        # Trial of the Crusader
+    4812,        # Icecrown Citadel
+    4987,        # The Ruby Sanctum
+})
+
+# Story / lore / side decided by hand instead of by the LLM.
+# By sort ID: every quest filed there.
+NARRATIVE_SORT_OVERRIDES = {
+    -372: "story",  # Death Knight starting experience: one story chain
+    -241: "side",   # Argent Tournament rank-ups (its dailies become daily)
+}
+# By chain: the whole chain holding the listed quest. Wins over the sort IDs.
+NARRATIVE_CHAIN_OVERRIDES = {
+    13663: "lore",  # The Black Knight's Orders (Argent Tournament Black Knight chain)
+    8905:  "lore",  # An Earnest Proposition (dungeon set 2 upgrade, Anthion and Valthalak)
+}
 
 PROFESSION_SORT_IDS = frozenset({
     -373,  # Jewelcrafting
+    -371,  # Inscription
     -324,  # First Aid
     -304,  # Cooking
     -264,  # Tailoring
@@ -165,6 +215,26 @@ PROFESSION_SORT_IDS = frozenset({
     -181,  # Alchemy
     -121,  # Blacksmithing
     -101,  # Fishing
+    -24,   # Herbalism
+})
+
+# RequiredSkillID values that are professions (SkillLine.dbc). Riding (762)
+# and other skills are not.
+PROFESSION_SKILL_IDS = frozenset({
+    129,  # First Aid
+    164,  # Blacksmithing
+    165,  # Leatherworking
+    171,  # Alchemy
+    182,  # Herbalism
+    185,  # Cooking
+    186,  # Mining
+    197,  # Tailoring
+    202,  # Engineering
+    333,  # Enchanting
+    356,  # Fishing
+    393,  # Skinning
+    755,  # Jewelcrafting
+    773,  # Inscription
 })
 
 PROFESSION_PATTERNS = (
@@ -331,10 +401,11 @@ def load_db_export(path, cache):
         objectives2-4     ← ObjectiveText2-4
         is_daily          ← Flags & 0x1000
         is_dungeon        ← QuestSortID < 0  (negative sort = instance zone)
-        quest_info_id     ← QuestInfoID  (41=PvP, 81=Dungeon, 85=Heroic)
+        quest_info_id     ← QuestInfoID  (41=PvP, 62/88/89=Raid, 81=Dungeon, 85=Heroic)
         prev_quest        ← PrevQuestID
         next_quest        ← NextQuestID
         allowable_classes ← AllowableClasses (>0 means class-specific)
+        required_skill_id ← quest_template_addon.RequiredSkillID
         sort_id           ← QuestSortID
         starter_npc       ← creature_queststarter JOIN creature_template
     """
@@ -373,6 +444,7 @@ def load_db_export(path, cache):
         entry["prev_quest"]        = q.get("prev_quest", 0) or 0
         entry["next_quest"]        = q.get("next_quest", 0) or 0
         entry["allowable_classes"] = q.get("allowable_classes", 0) or 0
+        entry["required_skill_id"] = q.get("required_skill_id", 0) or 0
         entry["starter_npc"]       = (q.get("starter_npc") or "")[:80]
         cache[qid] = entry
 
@@ -596,23 +668,17 @@ def build_chains(cache):
         for sibling in info.get("series", []):
             if sibling > 0 and sibling in cache:
                 uf.union(qid, sibling)
-        # DB prev/next quest links (more reliable)
-        # Do NOT bridge the dungeon ↔ open-world boundary: dungeon breadcrumb
-        # notes store prev_quest pointing at open-world quests, which would
-        # incorrectly drag the open-world chain into a dungeon classification.
-        # Use quest_info_id (81/85) for dungeon detection — sort_id<0 is not reliable
-        # (it also covers holiday events, Argent Tournament, AQ War Effort, etc.).
+        # DB prev/next quest links (more reliable). Dungeon and raid quests
+        # join the open-world chain they belong to: the [Dungeon] / [Raid]
+        # tag is added per quest in Pass 3, so the chain shares one story.
         for link_field in ("prev_quest", "next_quest"):
             linked = info.get(link_field, 0) or 0
             if linked > 0 and linked in cache:
-                this_dungeon  = (info.get("quest_info_id", 0) or 0) in (81, 85)
-                other_dungeon = (cache[linked].get("quest_info_id", 0) or 0) in (81, 85)
-                if this_dungeon == other_dungeon:
-                    uf.union(qid, linked)
+                uf.union(qid, linked)
     return uf.components()
 
 
-def is_profession_related(qid, cache, zone_labels):
+def is_profession_related(qid, cache):
     """Return True only on high-confidence profession signals.
 
     Uses sort_id (verified profession buckets) and required_skill_id (quest
@@ -623,80 +689,62 @@ def is_profession_related(qid, cache, zone_labels):
     info = cache.get(qid, {})
     if (info.get("sort_id", 0) or 0) in PROFESSION_SORT_IDS:
         return True
-    if (info.get("required_skill_id", 0) or 0) > 0:
+    if (info.get("required_skill_id", 0) or 0) in PROFESSION_SKILL_IDS:
         return True
     return False
 
 
 # ── Pass 1: rule-based classifier ─────────────────────────────────────────────
 
-def rule_based_category(chain_ids, cache, zone_labels):
+def rule_category(qid, cache):
     """
-    Apply rule-based classification for attune, class, profession, pvp, and
-    holiday quests. Returns one of those categories or None (→ needs LLM
-    classification).
+    Category a quest gets from its own data, whatever chain it is in: attune,
+    holiday, event, pvp, class or profession. None when the quest needs its
+    chain's story / lore / side decision.
 
-    Priority: attune > pvp > holiday > class > profession.
-    Dungeon quests are NOT bypassed here — they go through LLM classification
-    and receive a compound category (dungeon_story/lore/side/profession) in Pass 3.
-    Daily is also not applied here so story/lore chains with daily turn-ins
-    keep their narrative category.
+    Priority: attune > holiday > event > pvp > class > profession.
+    Holiday comes before pvp so Hallow's End pranks (typed PvP) stay holiday.
     """
-    for qid in chain_ids:
-        zone = zone_labels.get(qid, "").lower()
-        title = (cache.get(qid, {}).get("title") or "").lower()
-        desc  = (cache.get(qid, {}).get("description") or "").lower()
-
-        # Attunement: check zone label and quest text
-        for src in (zone, title, desc):
-            if "attunement" in src or "attune" in src:
-                return "attune"
-
-    # PvP: QuestInfoID=41 or known BG sort IDs
-    for qid in chain_ids:
-        info    = cache.get(qid, {})
-        qii     = info.get("quest_info_id", 0) or 0
-        sort_id = info.get("sort_id", 0) or 0
-        if qii == 41 or sort_id in PVP_SORT_IDS:
-            return "pvp"
-
-    # Holiday: seasonal event quests — checked BEFORE class so that class-restricted
-    # holiday quests (e.g. Priest "Garments of the Light", "Balance of Light and Shadow"
-    # during Hallow's End, sort_id=-262) are correctly labelled holiday, not class.
-    for qid in chain_ids:
-        sort_id = cache.get(qid, {}).get("sort_id", 0) or 0
-        if sort_id in HOLIDAY_SORT_IDS:
-            return "holiday"
-
-    # World/patch events — one-time or server-toggled events, not annual holidays
-    for qid in chain_ids:
-        sort_id = cache.get(qid, {}).get("sort_id", 0) or 0
-        if sort_id in EVENT_SORT_IDS:
-            return "event"
-
-    for qid in chain_ids:
-        # DB AllowableClasses > 0 means restricted to specific class(es).
-        # BUT: only count it as a true "class" quest if the chain also touches
-        # a CLASS_QUEST_SORT_ID. Generic gear vendor exchanges have allowable_classes
-        # but aren't real class quests, so use sort_id as a tightening filter.
-        ac = cache.get(qid, {}).get("allowable_classes", 0) or 0
-        sort_id = cache.get(qid, {}).get("sort_id", 0) or 0
-        if 0 < ac and bin(ac).count("1") <= 3 and sort_id in CLASS_QUEST_SORT_IDS:
-            return "class"
-
-    # Zone label fallback (rare)
-    for qid in chain_ids:
-        zone = zone_labels.get(qid, "").lower()
-        # Class quest: zone label exactly matches a class name
-        for cls in CLASS_NAMES:
-            if zone == cls or zone.endswith(f" {cls}") or f" {cls} " in zone:
-                return "class"
-
-    for qid in chain_ids:
-        if is_profession_related(qid, cache, zone_labels):
-            return "profession"
-
+    info    = cache.get(qid, {})
+    sort_id = info.get("sort_id", 0) or 0
+    if qid in ATTUNE_QUEST_IDS:
+        return "attune"
+    if sort_id in HOLIDAY_SORT_IDS or qid in CHILDRENS_WEEK_QUEST_IDS:
+        return "holiday"
+    if sort_id in EVENT_SORT_IDS or qid in EVENT_QUEST_IDS:
+        return "event"
+    if (info.get("quest_info_id", 0) or 0) == QUEST_INFO_PVP or sort_id in PVP_SORT_IDS:
+        return "pvp"
+    if sort_id in CLASS_SORT_IDS:
+        return "class"
+    if is_profession_related(qid, cache):
+        return "profession"
     return None
+
+
+def narrative_overrides(chain_ids, cache):
+    """
+    Return {quest_id: "story"|"lore"|"side"} for the quests in a chain whose
+    narrative was decided by hand (NARRATIVE_CHAIN_OVERRIDES, then
+    NARRATIVE_SORT_OVERRIDES).
+    """
+    for key, category in NARRATIVE_CHAIN_OVERRIDES.items():
+        if key in chain_ids:
+            return {qid: category for qid in chain_ids}
+    result = {}
+    for qid in chain_ids:
+        sort_id = cache.get(qid, {}).get("sort_id", 0) or 0
+        if sort_id in NARRATIVE_SORT_OVERRIDES:
+            result[qid] = NARRATIVE_SORT_OVERRIDES[sort_id]
+    return result
+
+
+def needs_llm(chain_ids, cache):
+    """True when some quest in the chain has neither a rule category nor a
+    hand-decided narrative, so the chain needs the LLM's story/lore/side."""
+    decided = narrative_overrides(chain_ids, cache)
+    return any(rule_category(q, cache) is None and q not in decided
+               for q in chain_ids)
 
 
 # ── Pass 2: LLM classification ────────────────────────────────────────────────
@@ -745,6 +793,8 @@ CANONICAL ZONE STORYLINES — only chains that are part of these arcs qualify as
 
 Eastern Kingdoms:
   Elwynn Forest      – Defias Brotherhood infiltration + murloc threat
+  Tirisfal Glades    – Forsaken vs the Scarlet Crusade + the Apothecarium's new plague
+  Silverpine Forest  – Arugal's worgen + Shadowfang Keep + Dalaran's Ambermill
   Dun Morogh         – Frostmane troll assault + Leper Gnome incursion (Gnomeregan fallout)
   Loch Modan         – Trogg invasion + Stonewrought Dam sabotage plot
   Westfall           – Defias Brotherhood investigation + Deadmines assault
@@ -766,6 +816,9 @@ Eastern Kingdoms:
 
 Kalimdor:
   Durotar            – Burning Blade demon cult + Zalazane's Echo Isles corruption
+  Teldrassil         – Gnarlpine furbolg corruption + the Shadowglen moonwell
+  Azuremyst Isle     – Exodar crash + blood elf saboteurs + Stillpine furbolgs
+  Bloodmyst Isle     – Sun King's blood elves + the Vector Coil + Bloodmyst corruption
   Mulgore            – Venture Company threat + tauren coming-of-age rites
   The Barrens        – Quilboar Razorfen threat + centaur conflict + Wailing Caverns corruption
   Darkshore          – Twilight's Hammer introduction + communication relay repair
@@ -781,7 +834,8 @@ Kalimdor:
   Winterspring       – Kel'Theril night elf spirit curse + corrupted furbolg purification
   Silithus           – Twilight's Hammer cultists + Silithid invasion buildup (AQ)
   Azshara            – Naga operations + Hydraxian Waterlords
-  Outland:
+
+Outland:
   Hellfire Peninsula – Fel orc uprising + Hand of Gul'dan + establishing beachheads
   Zangarmarsh        – Naga draining the swamp + Cenarion Expedition survival
   Terokkar Forest    – Auchindoun and Shadow Council + Ethereal operations
@@ -806,9 +860,12 @@ DECISION RULES:
 3. Everything else → side
 4. Does the chain train/unlock/reward a tradeskill? → profession (overrides 1-3)
 
-Classify the chain as a UNIT, not quest by quest. Starting zones (Camp Narache,
-Valley of Trials, Northshire, Deathknell, etc.) are story — they establish the main
-conflict. Chains with narrative flavor in quest text but no arc and no consequence → side.
+Classify the chain as a UNIT, not quest by quest. Starting zones (Northshire, Valley of
+Trials, Deathknell, etc.) are judged like any other zone: their main questline is story,
+the rest lore or side. Chains with narrative flavor in quest text but no arc and no
+consequence → side. Quests that only trade tokens or materials for a piece of gear
+(tier set exchanges such as Paragons of Power or Naxxramas tier tokens) → side.
+Repeatable daily quests are tagged [Daily] separately; judge a chain by its other quests.
 
 Return ONLY valid JSON in exactly this format (no markdown, no explanation, just JSON):
 {"results": [{"chain_id": "<id>", "category": "story|lore|side|profession", "reasoning": "<one sentence>"}]}
@@ -874,7 +931,8 @@ def classify_chains_llm(batch, cache, zone_labels, client=None):
     client param is ignored (kept for signature compatibility).
     batch: list of (chain_id, chain_ids) tuples
     Returns {chain_id: "story"|"lore"|"side"|"profession"} dict.
-    Falls back to "side" for any chain that fails to classify.
+    A chain the LLM did not answer for is left out, so it stays unclassified
+    and --resume asks again.
     """
     import subprocess
 
@@ -917,10 +975,9 @@ def classify_chains_llm(batch, cache, zone_labels, client=None):
             results = {}
             for item in parsed.get("results", []):
                 cid = str(item.get("chain_id", ""))
-                cat = item.get("category", "side").lower()
-                if cat not in ("story", "lore", "side", "profession"):
-                    cat = "side"
-                results[cid] = cat
+                cat = str(item.get("category", "")).lower()
+                if cat in ("story", "lore", "side", "profession"):
+                    results[cid] = cat
             return results
 
         except subprocess.TimeoutExpired:
@@ -936,68 +993,61 @@ def classify_chains_llm(batch, cache, zone_labels, client=None):
             if attempt < 2:
                 time.sleep(2 ** attempt)
 
-    # All retries failed — fallback to "side" for every chain in this batch
-    print("    All retries failed; marking batch as 'side'.")
-    return {str(chain_id): "side" for chain_id, _ in batch}
+    # All retries failed: leave the batch unclassified for --resume.
+    print("    All retries failed; batch left unclassified.")
+    return {}
 
 
 # ── Pass 3: post-LLM mechanical adjustments ───────────────────────────────────
 
-def apply_dungeon_tag(base_category, chain_ids, cache):
+def is_raid(info):
+    return ((info.get("quest_info_id", 0) or 0) in QUEST_INFO_RAID
+            or (info.get("sort_id", 0) or 0) in RAID_SORT_IDS)
+
+
+def quest_category(qid, chain_category, overrides, cache):
     """
-    After LLM classification, apply dungeon compound tag and daily upgrade.
+    Final category of one quest. chain_category is the chain's story / lore /
+    side / profession from the LLM (None if it has none); overrides is the
+    chain's narrative_overrides().
 
-    Dungeon chains get a compound category: dungeon_story / dungeon_lore /
-    dungeon_side. Profession stays as profession, even for dungeon-linked
-    profession quests, so the trade-skill tag is preserved.
-    A chain is dungeon if any quest has sort_id < 0 or quest_info_id in (81, 85).
-
-    Daily: only upgrade side→daily; story/lore/dungeon_* keep their narrative value.
+    Rule categories win. Otherwise the quest's narrative (hand-decided, else
+    the chain's) gets the raid_ or dungeon_ prefix for raid and dungeon quests,
+    and an open-world daily becomes daily. Returns None when the quest has no
+    category yet (its chain still needs the LLM).
     """
-    any_dungeon = any(
-        (cache.get(q, {}).get("quest_info_id", 0) or 0) in (81, 85)
-        for q in chain_ids
-    )
-
-    if any_dungeon and base_category in ("story", "lore", "side"):
-        # DK starting zone is instanced (sort_id=-372) but still an "intro" zone.
-        # Apply intro AFTER dungeon tag is resolved below.
-        result = f"dungeon_{base_category}"
-    else:
-        result = base_category
-
-    # Upgrade to intro for any chain whose quests touch a starting zone sort_id.
-    # Applies regardless of LLM category (side/lore/story/class all become intro).
-    # DK chains are class-flagged (allowable_classes=32) but still intro.
-    # Chains that span starting zone + next zone (e.g. sort_ids [1, 132]) still
-    # qualify via intersection rather than strict subset.
-    # Excluded: holiday/pvp/attune (keep their own tag); deprecated placeholders.
-    if base_category not in ("holiday", "event", "pvp", "attune", "profession"):
-        chain_sort_ids = {cache.get(q, {}).get("sort_id", 0) or 0 for q in chain_ids}
-        if chain_sort_ids & STARTING_ZONE_SORT_IDS:
-            # Skip <DEPRECATED>/<UNUSED> placeholder quests that were removed in-game
-            titles = [cache.get(q, {}).get("title") or "" for q in chain_ids]
-            if not all(t.startswith("<") for t in titles):
-                return "intro"
-
-    # For open-world quests: upgrade side→daily if any quest has daily flag
-    if result == "side":
-        any_daily = any(cache.get(q, {}).get("is_daily", False) for q in chain_ids)
-        if any_daily:
-            return "daily"
-
-    return result
+    rule = rule_category(qid, cache)
+    if rule:
+        return rule
+    base = overrides.get(qid, chain_category)
+    if base is None or base == "profession":
+        return base
+    info = cache.get(qid, {})
+    if is_raid(info):
+        return f"raid_{base}"
+    if (info.get("quest_info_id", 0) or 0) in QUEST_INFO_DUNGEON:
+        return f"dungeon_{base}"
+    if info.get("is_daily", False):
+        return "daily"
+    return base
 
 
 # ── Lua writer ────────────────────────────────────────────────────────────────
+
+CATEGORY_ORDER = [
+    "story", "lore", "attune", "class", "profession", "daily", "pvp", "holiday", "event",
+    "dungeon_story", "dungeon_lore", "dungeon_side", "raid_story", "raid_lore", "raid_side",
+    "side",
+]
 
 HEADER_TEMPLATE = """\
 -- QuestClassification Quest Data
 -- Generated by classify_quests.py
 --
 -- QC_QuestCategory[questID] = category string
--- Categories: intro | story | lore | attune | class | profession | daily | pvp | holiday | event
---             dungeon_story | dungeon_lore | dungeon_side | side
+-- Categories: story | lore | attune | class | profession | daily | pvp | holiday | event
+--             dungeon_story | dungeon_lore | dungeon_side | raid_story | raid_lore | raid_side
+--             side
 --
 -- A quest is absent from this table only when it was never classified —
 -- the addon shows [?] in NPC dialogs for those quests.
@@ -1013,12 +1063,8 @@ def write_lua(path, quest_categories, title_map):
     for qid, cat in quest_categories.items():
         by_cat[cat].append(qid)
 
-    cat_order = [
-        "intro", "story", "lore", "attune", "class", "profession", "daily", "pvp", "holiday", "event",
-        "dungeon_story", "dungeon_lore", "dungeon_side", "side",
-    ]
     lines = [HEADER_TEMPLATE.rstrip()]
-    for cat in cat_order:
+    for cat in CATEGORY_ORDER:
         if cat not in by_cat:
             continue
         lines.append(f"-- {cat.upper()}")
@@ -1038,36 +1084,45 @@ def write_lua(path, quest_categories, title_map):
         f.write("\n".join(lines))
 
 
-# ── Incremental save helper ───────────────────────────────────────────────────
+# ── Assignments file ──────────────────────────────────────────────────────────
 
-def _save_incremental(chains, rule_assignments, llm_assignments,
-                      cache, zone_labels, path, llm_done=None):
-    """Write current assignments to JSON so --resume can pick up from here.
-    llm_done: set of chain roots that have been processed by LLM (even if result was 'side').
+def write_assignments(path, chains, llm_assignments, llm_done, cache, zone_labels):
     """
-    if llm_done is None:
-        llm_done = set()
-    combined = {**llm_assignments, **rule_assignments}
+    Write category_assignments.json and return {quest_id: category}.
+
+    Per chain: "category" is the LLM's story / lore / side / profession (null
+    when the chain did not need the LLM or has no answer yet), "needs_llm" and
+    "llm_done" say whether it still needs one, and "quest_categories" holds the
+    final category of every quest (null while its chain needs the LLM).
+    --resume and questdata_to_sql.py read this file.
+    """
+    quest_categories = {}
     out = {}
     for root, members in chains.items():
-        cat = combined.get(root, "side")
+        overrides = narrative_overrides(members, cache)
+        chain_cat = llm_assignments.get(root)
+        cats = {q: quest_category(q, chain_cat, overrides, cache) for q in members}
+        quest_categories.update({q: c for q, c in cats.items() if c})
         out[str(root)] = {
-            "category": cat,
+            "category": chain_cat,
             "chain_length": len(members),
             "quest_ids": members,
+            "quest_categories": {str(q): c for q, c in cats.items()},
             "titles": [cache.get(q, {}).get("title") or f"#{q}" for q in members[:5]],
             "zone": next((zone_labels.get(q) for q in members if zone_labels.get(q)), None),
+            "needs_llm": needs_llm(members, cache),
             "llm_done": root in llm_done,
         }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
+    return quest_categories
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Classify WoW quests into 7 narrative categories using Claude.")
+        description="Classify WoW quests into the addon's quest categories using Claude.")
     parser.add_argument(
         "--apply", action="store_true",
         help="Write QuestData.lua after classification (default: only write JSON).")
@@ -1079,12 +1134,13 @@ def main():
         help="Skip loading quest text from the DB export (wow_quests.json).")
     parser.add_argument(
         "--skip-llm", action="store_true",
-        help="Skip LLM classification (useful for testing the scraping pipeline).")
+        help="Skip LLM classification; chains that need it stay unclassified "
+             "(useful for testing the rules).")
     parser.add_argument(
         "--resume", action="store_true",
-        help="Load existing category_assignments.json and only re-run LLM on chains "
-             "still marked 'side' from a previous incomplete run. Use with --max-batches "
-             "to make incremental progress when the OAuth token expires mid-run.")
+        help="Load existing category_assignments.json and only run the LLM on chains "
+             "it has not classified yet. Use with --max-batches to make incremental "
+             "progress when the OAuth token expires mid-run.")
     parser.add_argument(
         "--max-batches", type=int, default=0,
         help="Stop LLM pass after this many batches (0 = unlimited). "
@@ -1177,60 +1233,50 @@ def main():
 
     # ── Pass 1: rule-based ────────────────────────────────────────────────────
     print("=== Pass 1: Rule-Based Classification ===")
-    rule_assignments = {}  # {chain_root: category}
     rule_counts = defaultdict(int)
-
+    overridden = 0
     for root, members in chains.items():
-        cat = rule_based_category(members, cache, zone_labels)
-        if cat:
-            rule_assignments[root] = cat
-            rule_counts[cat] += 1
+        overrides = narrative_overrides(members, cache)
+        for qid in members:
+            cat = rule_category(qid, cache)
+            if cat:
+                rule_counts[cat] += 1
+            elif qid in overrides:
+                overridden += 1
 
     for cat, n in sorted(rule_counts.items()):
-        print(f"  {cat:10s}: {n:,} chains")
-    needs_llm = [(root, members) for root, members in chains.items()
-                 if root not in rule_assignments]
-    print(f"  → {len(needs_llm):,} chains need LLM classification.\n")
+        print(f"  {cat:10s}: {n:,} quests")
+    print(f"  {'by hand':10s}: {overridden:,} quests (NARRATIVE_*_OVERRIDES)")
+    llm_chains = [(root, members) for root, members in chains.items()
+                  if needs_llm(members, cache)]
+    print(f"  → {len(llm_chains):,} chains need LLM classification.\n")
 
     # ── Pass 2: LLM classification ────────────────────────────────────────────
-    llm_assignments = {}  # {chain_root: category}
-    llm_done = set()      # chain roots that have been processed by LLM at least once
+    llm_assignments = {}  # {chain_root: "story"|"lore"|"side"|"profession"}
+    llm_done = set()      # chain roots the LLM has answered for
 
-    # --resume: load previous assignments so already-classified chains are kept
-    prev_assignments = {}
+    # --resume: keep the answers of a previous run
     if args.resume and os.path.exists(ASSIGN_FILE):
         with open(ASSIGN_FILE, "r", encoding="utf-8") as f:
             prev_data = json.load(f)
         for root_str, info in prev_data.items():
             root = int(root_str)
-            prev_assignments[root] = info.get("category", "side")
-            if info.get("llm_done", False):
+            # Files from before per-quest tagging hold final categories here.
+            if (info.get("llm_done", False)
+                    and info.get("category") in ("story", "lore", "side", "profession")):
+                llm_assignments[root] = info["category"]
                 llm_done.add(root)
-        # Restore non-side rule-based and previously-good LLM results
-        for root, cat in prev_assignments.items():
-            if cat != "side":
-                llm_assignments[root] = cat
-        # In resume mode, only re-run chains that are "side" AND not yet LLM-processed
-        needs_llm = [(root, members) for root, members in chains.items()
-                     if root not in rule_assignments
-                     and prev_assignments.get(root, "side") == "side"
-                     and root not in llm_done]
-        n_done = len(prev_assignments) - len(needs_llm) - sum(
-            1 for r in rule_assignments if r in prev_assignments)
-        print(f"  --resume: {len(needs_llm):,} chains still need classification "
-              f"({max(0,n_done):,} already done, {len(llm_done):,} LLM-processed as side).\n")
+        print(f"  --resume: {len(llm_done):,} chains already classified.\n")
     elif args.resume:
         print(f"  --resume: no existing {ASSIGN_FILE} found; running full pass.\n")
+    todo = [(root, members) for root, members in llm_chains if root not in llm_done]
 
     if args.skip_llm:
-        print("(--skip-llm: skipping LLM classification; defaulting to 'side')\n")
-        for root, _ in needs_llm:
-            if root not in llm_assignments:
-                llm_assignments[root] = "side"
+        print(f"(--skip-llm: {len(todo):,} chains left unclassified)\n")
     else:
         print("=== Pass 2: LLM Classification ===")
         print(f"  Model: {MODEL}  |  batch size: {CHAINS_PER_BATCH}")
-        remaining = len(needs_llm)
+        remaining = len(todo)
         max_b = args.max_batches if args.max_batches > 0 else 999999
         cap = min(remaining, max_b * CHAINS_PER_BATCH)
         print(f"  Classifying {remaining:,} chains "
@@ -1245,13 +1291,9 @@ def main():
         for batch_start in range(0, remaining, CHAINS_PER_BATCH):
             if args.max_batches > 0 and batches_done >= args.max_batches:
                 print(f"  --max-batches {args.max_batches} reached; stopping LLM pass.")
-                # Mark remaining as side so they're re-run next time
-                for root, _ in needs_llm[batch_start:]:
-                    if root not in llm_assignments:
-                        llm_assignments[root] = "side"
                 break
 
-            batch = needs_llm[batch_start:batch_start + CHAINS_PER_BATCH]
+            batch = todo[batch_start:batch_start + CHAINS_PER_BATCH]
             batch_num = batch_start // CHAINS_PER_BATCH + 1
             total_batches = (remaining + CHAINS_PER_BATCH - 1) // CHAINS_PER_BATCH
 
@@ -1261,52 +1303,42 @@ def main():
 
             results = classify_chains_llm(batch, cache, zone_labels, client=llm_client)
             for root, _ in batch:
-                cat = results.get(str(root), "side")
-                llm_assignments[root] = cat
-                llm_done.add(root)   # mark as processed regardless of category
-                llm_counts[cat] += 1
+                cat = results.get(str(root))
+                if cat:
+                    llm_assignments[root] = cat
+                    llm_done.add(root)
+                    llm_counts[cat] += 1
+                else:
+                    llm_counts["unanswered"] += 1
 
-            print(f"done ({', '.join(f'{c}:{n}' for c,n in sorted(results.items() if hasattr(results,'items') else [])[:4])})")
+            print(f"done ({', '.join(f'{c}:{n}' for c,n in sorted(results.items())[:4])})")
             batches_done += 1
 
             # Save incremental progress every 5 batches so --resume can pick up
             if batches_done % 5 == 0:
-                _save_incremental(chains, rule_assignments, llm_assignments,
-                                  cache, zone_labels, ASSIGN_FILE, llm_done)
+                write_assignments(ASSIGN_FILE, chains, llm_assignments, llm_done,
+                                  cache, zone_labels)
 
             # Small pause between subprocess calls
             time.sleep(1)
 
         print()
-        for cat in ["story", "lore", "profession", "side"]:
+        for cat in ["story", "lore", "profession", "side", "unanswered"]:
             print(f"  {cat:10s}: {llm_counts[cat]:,} chains")
         print()
-        # Final incremental save before Pass 3
-        _save_incremental(chains, rule_assignments, llm_assignments,
-                          cache, zone_labels, ASSIGN_FILE, llm_done)
 
-    # ── Pass 3: post-LLM mechanical adjustments ───────────────────────────────
-    print("=== Pass 3: Dungeon Tagging & Daily Upgrades ===")
-    combined = {**llm_assignments, **rule_assignments}  # rule overrides llm
-    tag_counts = defaultdict(int)
-
-    for root, members in chains.items():
-        base = combined.get(root, "side")
-        adjusted = apply_dungeon_tag(base, members, cache)
-        if adjusted != base:
-            combined[root] = adjusted
-            tag_counts[adjusted] += 1
-
-    for tag, n in sorted(tag_counts.items()):
-        print(f"  +{n} chains → {tag}")
+    # ── Pass 3: per-quest categories, write category_assignments.json ─────────
+    print("=== Pass 3: Quest Categories ===")
+    quest_categories = write_assignments(ASSIGN_FILE, chains, llm_assignments, llm_done,
+                                         cache, zone_labels)
+    print(f"✓  Written {ASSIGN_FILE}  ({len(chains):,} chains)")
+    print( "   Review this file before turning it into SQL (tools/questdata_to_sql.py).")
+    unclassified = [(root, members) for root, members in llm_chains if root not in llm_done]
+    if unclassified:
+        n_quests = sum(len(members) for _, members in unclassified)
+        print(f"  WARNING: {len(unclassified):,} chains ({n_quests:,} quests) still need "
+              f"the LLM; run again with --resume.")
     print()
-
-    # ── Expand chain assignments to individual quest IDs ──────────────────────
-    quest_categories = {}  # {quest_id: category}
-    for root, members in chains.items():
-        cat = combined.get(root, "side")
-        for qid in members:
-            quest_categories[qid] = cat
 
     # ── Build extended title map ──────────────────────────────────────────────
     # Include all classified quest titles (not just formerly-main quests)
@@ -1325,31 +1357,12 @@ def main():
         final_counts[cat] += 1
 
     total_quests = len(quest_categories)
-    for cat in ["intro", "story", "lore", "attune", "class", "profession", "daily", "pvp",
-                "dungeon_story", "dungeon_lore", "dungeon_side", "side"]:
+    for cat in CATEGORY_ORDER:
         n = final_counts.get(cat, 0)
         pct = 100.0 * n / total_quests if total_quests else 0
         print(f"  {cat:14s}: {n:>6,} quests ({pct:.1f}%)")
     print(f"  {'TOTAL':10s}: {total_quests:>6,} quests")
     print()
-
-    # ── Write category_assignments.json ───────────────────────────────────────
-    assignments_out = {}
-    for root, members in chains.items():
-        cat = combined.get(root, "side")
-        assignments_out[str(root)] = {
-            "category": cat,
-            "chain_length": len(members),
-            "quest_ids": members,
-            "titles": [cache.get(q, {}).get("title") or f"#{q}" for q in members[:5]],
-            "zone": next((zone_labels.get(q) for q in members if zone_labels.get(q)), None),
-            "llm_done": root in llm_done,
-        }
-
-    with open(ASSIGN_FILE, "w", encoding="utf-8") as f:
-        json.dump(assignments_out, f, indent=2)
-    print(f"✓  Written {ASSIGN_FILE}  ({len(assignments_out):,} chains)")
-    print( "   Review this file before applying to QuestData.lua.\n")
 
     # ── Optionally write QuestData.lua ────────────────────────────────────────
     if args.apply:

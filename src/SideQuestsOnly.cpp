@@ -30,10 +30,11 @@ namespace
     // Characters of ids in one c row, so the row stays under the limit.
     constexpr size_t ROW_LIMIT = 220;
 
-    constexpr std::array<std::string_view, 14> CATEGORIES = {
+    // "intro" is retired; it stays valid until no shipped data uses it.
+    constexpr std::array<std::string_view, 17> CATEGORIES = {
         "intro", "story", "lore", "attune", "class", "profession", "daily",
         "pvp", "holiday", "event", "dungeon_story", "dungeon_lore",
-        "dungeon_side", "side"
+        "dungeon_side", "raid_story", "raid_lore", "raid_side", "side"
     };
 
     bool _enabled = true;

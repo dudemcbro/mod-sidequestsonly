@@ -4,7 +4,9 @@ questdata_to_sql.py - Turn the classifier's output into the module's world SQL.
 
 Reads QC_QuestCategory from a QuestData.lua (what classify_quests.py --apply
 writes) or the per-chain map in category_assignments.json, and writes
-data/sql/world/mod_sidequestsonly_quest.sql.
+data/sql/world/mod_sidequestsonly_quest.sql. It stops when the classifier left
+chains without an LLM answer, unless --allow-incomplete (those quests are left
+out and show as [?]).
 
     python3 tools/questdata_to_sql.py QuestData.lua
     python3 tools/questdata_to_sql.py category_assignments.json -o out.sql
@@ -21,7 +23,8 @@ import sys
 
 CATEGORIES = (
     "intro", "story", "lore", "attune", "class", "profession", "daily", "pvp",
-    "holiday", "event", "dungeon_story", "dungeon_lore", "dungeon_side", "side",
+    "holiday", "event", "dungeon_story", "dungeon_lore", "dungeon_side",
+    "raid_story", "raid_lore", "raid_side", "side",
 )
 ROWS_PER_INSERT = 500
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,13 +39,21 @@ def from_lua(path):
     return {int(q): c for q, c in pairs}
 
 
-def from_json(path):
+def from_json(path, allow_incomplete=False):
     with open(path, encoding="utf-8") as f:
         chains = json.load(f)
+    pending = [c for c in chains.values() if c.get("needs_llm") and not c.get("llm_done")]
+    if pending and not allow_incomplete:
+        sys.exit(f"{len(pending)} chains in {path} still need the LLM: run "
+                 "classify_quests.py --resume, or pass --allow-incomplete")
     result = {}
     for chain in chains.values():
+        # Older files have one category per chain and no quest_categories.
+        per_quest = chain.get("quest_categories")
         for quest in chain.get("quest_ids", []):
-            result[int(quest)] = chain["category"]
+            category = per_quest.get(str(quest)) if per_quest is not None else chain["category"]
+            if category:
+                result[int(quest)] = category
     return result
 
 
@@ -53,10 +64,14 @@ def main():
     parser.add_argument("-o", "--output", default=DEFAULT_OUT)
     parser.add_argument("--replace", action="store_true",
                         help="overwrite existing rows instead of keeping them")
+    parser.add_argument("--allow-incomplete", action="store_true",
+                        help="write the SQL even if some chains have no LLM answer yet")
     args = parser.parse_args()
 
-    load = from_json if args.source.endswith(".json") else from_lua
-    quests = load(args.source)
+    if args.source.endswith(".json"):
+        quests = from_json(args.source, args.allow_incomplete)
+    else:
+        quests = from_lua(args.source)
     if not quests:
         sys.exit(f"No classifications found in {args.source}")
     unknown = sorted({c for c in quests.values() if c not in CATEGORIES})

@@ -2,7 +2,8 @@
 
 An [AzerothCore](https://www.azerothcore.org/) (WotLK 3.3.5a) module and client addon
 that badge every quest with what kind of quest it is, so you can tell the story apart
-from the filler: `[Story]`, `[Lore]`, `[Side]`, `[Class]`, `[Dungeon][Story]` and so on.
+from the filler: `[Story]`, `[Lore]`, `[Side]`, `[Class]`, `[Dungeon][Story]`, `[Raid][Lore]`
+and so on.
 
 The server keeps the categories in the world database and sends them to the
 SideQuestsOnly addon. GMs can change a quest's category in game and every player with
@@ -22,7 +23,6 @@ the addon sees it at once.
 
 | Badge | Category | Meaning |
 |---|---|---|
-| `[Intro]` | `intro` | Race starting zone quest (levels 1 to 10) |
 | `[Story]` | `story` | Drives the zone or expansion story |
 | `[Lore]` | `lore` | World-building; optional but meaningful |
 | `[Attune]` | `attune` | Needed to enter a raid or dungeon |
@@ -35,8 +35,15 @@ the addon sees it at once.
 | `[Dungeon][Story]` | `dungeon_story` | Dungeon quest with a real story |
 | `[Dungeon][Lore]` | `dungeon_lore` | Dungeon quest with lore content |
 | `[Dungeon][Side]` | `dungeon_side` | Dungeon quest, filler |
+| `[Raid][Story]` | `raid_story` | Raid quest with a real story |
+| `[Raid][Lore]` | `raid_lore` | Raid quest with lore content |
+| `[Raid][Side]` | `raid_side` | Raid quest, filler |
 | `[Side]` | `side` | Filler with no story value |
 | `[?]` | | Not classified (NPC dialogs only) |
+
+`[Intro]` (`intro`, starting zone quests) is retired: the classifier no longer assigns it
+and starting zone quests get story, lore or side like everywhere else. The server and
+addon still accept it for data from older classifier runs.
 
 ## Requirements
 
@@ -69,9 +76,9 @@ the addon sees it at once.
 Copy `client-addon/SideQuestsOnly/` into the client's `Interface/AddOns/` folder so the
 `.toc` sits at `Interface/AddOns/SideQuestsOnly/SideQuestsOnly.toc`, then restart the
 client. Remove any older SideQuestsOnly first: version 2 has no `QuestData.lua`, it gets
-everything from the server.
+everything from the server. Raid categories need addon 2.1.0 or later.
 
-On login the addon prints `SideQuestsOnly v2.0.0  9528 quests classified by the server.`
+On login the addon prints `SideQuestsOnly v2.1.0  9528 quests classified by the server.`
 If the server does not answer within 15 seconds it says so; `/sqo sync` asks again.
 
 ## Configuration
@@ -137,12 +144,24 @@ quest an NPC is offering.
 
 ## Classification
 
-The categories came from `tools/classify_quests.py`, which combines rules (attunements,
-class, profession, daily and dungeon quests) with an LLM pass over quest chains for the
-story / lore / side split, using warcraft.wiki.gg zone storyline and campaign pages and
-pre-Cataclysm WoWWiki pages as references. Whole chains share one category. The shipped
-SQL is the classifier's 2026-03-27 run (`category_assignments.json`), the first with the
-`event` category and the fix that stopped starting-zone quests being labelled `holiday`.
+The categories come from `tools/classify_quests.py`, which combines rules with an LLM
+pass over quest chains for the story / lore / side split, using warcraft.wiki.gg zone
+storyline and campaign pages and pre-Cataclysm WoWWiki pages as references.
+
+- Quests linked by previous / next quest form a chain, and a chain shares one story /
+  lore / side decision.
+- Rules tag single quests, whatever their chain: attunement and key quests (a fixed list),
+  holidays, world events, PvP, class quests (the class quest sorts) and professions.
+- Dungeon and raid quests get the `[Dungeon]` or `[Raid]` prefix on their chain's story /
+  lore / side. Raid quests are the ones the game types as raid quests, plus every quest
+  filed under a raid.
+- Open-world daily quests are `[Daily]`.
+- A few story / lore / side calls are made by hand (`NARRATIVE_*_OVERRIDES`): the Death
+  Knight start is story, the Argent Tournament's Black Knight chain and the dungeon set 2
+  upgrade chain are lore, and the rest of the Tournament is side.
+
+The shipped SQL is still the classifier's 2026-03-27 run (`category_assignments.json`),
+from before these rules.
 
 To regenerate the SQL after a new classifier run:
 
@@ -151,6 +170,9 @@ python3 tools/questdata_to_sql.py path/to/QuestData.lua
 # or straight from the classifier's review file:
 python3 tools/questdata_to_sql.py path/to/category_assignments.json
 ```
+
+It stops if the classifier left chains without an LLM answer (run the classifier again
+with `--resume`); `--allow-incomplete` writes the SQL anyway and leaves those quests out.
 
 `tools/classify_quests.py` (Claude) and `tools/classify_quests_codex.py` (Codex CLI) need
 `requests` and either the `anthropic` package with `ANTHROPIC_API_KEY` set or an
