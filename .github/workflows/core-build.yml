@@ -1,0 +1,10 @@
+name: core-build
+# Manual only while the repository is private: each run is an hour-long core build.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: azerothcore/reusable-workflows/.github/workflows/core_build_modules.yml@main
+    with:
+      module_repo: ${{ github.event.repository.name }}

@@ -1,0 +1,12 @@
+*.swp
+*.swo
+*.log
+*.bak
+build/
+__pycache__/
+
+# Classifier caches and work files (README, Classification): large and rebuilt on demand.
+tools/wow_quests.json
+tools/quest_chain_cache.json
+tools/category_assignments.json*
+tools/QuestData.lua*

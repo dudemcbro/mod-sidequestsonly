@@ -1,0 +1,16 @@
+[worldserver]
+
+###################################################################################################
+# mod-sidequestsonly
+#
+# Sends quest categories (Story, Lore, Side, ...) to the SideQuestsOnly client addon.
+# The categories live in the world table mod_sidequestsonly_quest.
+###################################################################################################
+
+#
+#    SideQuestsOnly.Enable
+#        Description: Answer the addon and tell it which quest each quest dialog shows.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+SideQuestsOnly.Enable = 1

@@ -1,0 +1,7 @@
+## Interface: 30300
+## Title: SideQuestsOnly
+## Notes: Category badges ([Story], [Lore], [Side], ...) on quests in the quest log and NPC quest dialogs. Needs a server with mod-sidequestsonly.
+## Author: dudemcbro
+## Version: 2.0.0
+
+SideQuestsOnly.lua
