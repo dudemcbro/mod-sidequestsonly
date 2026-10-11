@@ -329,7 +329,28 @@ public:
         SERVERHOOK_CAN_PACKET_SEND
     }) { }
 
-    bool CanPacketSend(WorldSession* session, WorldPacket const& packet) override
+    // Cores before mid-2026 pass the packet as WorldPacket&, newer ones as
+    // WorldPacket const&; each core overrides the one it has (no override
+    // keyword, so the other compiles too).
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winconsistent-missing-override"
+#endif
+    bool CanPacketSend(WorldSession* session, WorldPacket& packet)
+    {
+        return OnPacketSend(session, packet);
+    }
+
+    bool CanPacketSend(WorldSession* session, WorldPacket const& packet)
+    {
+        return OnPacketSend(session, packet);
+    }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
+private:
+    bool OnPacketSend(WorldSession* session, WorldPacket const& packet)
     {
         if (!_enabled)
             return true;
