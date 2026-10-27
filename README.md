@@ -163,23 +163,44 @@ storyline and campaign pages and pre-Cataclysm WoWWiki pages as references.
 The shipped SQL is still the classifier's 2026-03-27 run (`category_assignments.json`),
 from before these rules.
 
-To regenerate the SQL after a new classifier run:
+To run the classifier:
 
-```sh
-python3 tools/questdata_to_sql.py path/to/QuestData.lua
-# or straight from the classifier's review file:
-python3 tools/questdata_to_sql.py path/to/category_assignments.json
-```
+1. Export the quests with `tools/export_quests.py`, where it can reach `acore_world` and
+   the server's DBC files (usually on the server). It writes `wow_quests.json` with each
+   quest's text, links, sort and zone name (from `AreaTable.dbc` and `QuestSort.dbc`).
+   It uses PyMySQL when installed, otherwise the `mysql` client.
 
-It stops if the classifier left chains without an LLM answer (run the classifier again
-with `--resume`); `--allow-incomplete` writes the SQL anyway and leaves those quests out.
+   ```sh
+   python3 export_quests.py --conf /path/to/worldserver.conf
+   # or: MYSQL_PWD=... python3 export_quests.py --host ... --user ... --dbc-dir /path/to/dbc
+   ```
 
-`tools/classify_quests.py` asks an authenticated `claude` CLI (`claude --print`). It
-also needs `requests`, the `anthropic` package and `ANTHROPIC_API_KEY` or
-`CLAUDE_CODE_OAUTH_TOKEN` set. It reads and writes its caches (`wow_quests.json`,
-`quest_chain_cache.json`, `category_assignments.json`) in the folder it runs in; those
-are large and kept out of the repository. `tools/expand_chains.py` is the older
-main/side chain expander, kept for reference.
+2. Copy `wow_quests.json` into `tools/` and run the classifier from there. The LLM pass
+   calls an authenticated `claude` CLI (`claude --print`, model `MODEL` in the script),
+   five chains per call. `--skip-llm` runs only the rules; `--max-batches N` stops after
+   N calls, and `--resume` keeps the answers so far.
+
+   ```sh
+   cd tools
+   python3 classify_quests.py --max-batches 50
+   python3 classify_quests.py --resume --max-batches 50   # until no chain is left
+   ```
+
+   It writes `category_assignments.json`, the per-chain and per-quest result to review.
+
+3. Turn it into the module's SQL:
+
+   ```sh
+   python3 tools/questdata_to_sql.py tools/category_assignments.json
+   ```
+
+   It stops if the classifier left chains without an LLM answer (run the classifier
+   again with `--resume`); `--allow-incomplete` writes the SQL anyway and leaves those
+   quests out. It also reads `QC_QuestCategory` from an old v1 `QuestData.lua`.
+
+`wow_quests.json` and `category_assignments.json` are large and kept out of the
+repository. `tools/expand_chains.py` is the older main/side chain expander, kept for
+reference.
 
 ## Testing
 

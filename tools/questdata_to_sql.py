@@ -2,8 +2,8 @@
 """
 questdata_to_sql.py - Turn the classifier's output into the module's world SQL.
 
-Reads QC_QuestCategory from a QuestData.lua (what classify_quests.py --apply
-writes) or the per-chain map in category_assignments.json, and writes
+Reads the per-chain map in category_assignments.json (from classify_quests.py)
+or QC_QuestCategory from an old v1 QuestData.lua, and writes
 data/sql/world/mod_sidequestsonly_quest.sql. It stops when the classifier left
 chains without an LLM answer, unless --allow-incomplete (those quests are left
 out and show as [?]).

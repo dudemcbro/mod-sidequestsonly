@@ -2,69 +2,37 @@
 """
 classify_quests.py  –  Classify WoW 3.3.5a quests into addon quest categories.
 
-Uses Claude (claude-opus-4-6) as the primary classifier for story / lore / side
-decisions, with rules for attune, holiday, event, pvp, class and profession
-quests, and per-quest dungeon, raid and daily tags.
+Uses Claude (the claude CLI, model MODEL) as the primary classifier for story /
+lore / side decisions, with rules for attune, holiday, event, pvp, class and
+profession quests, and per-quest dungeon, raid and daily tags.
 
 Chains share one story / lore / side decision, so opening kill/collect quests
 in story chains get [Story] too. Rules look at single quests: a PvP daily or a
 key quest in a chain does not change the rest of the chain.
 
 Prerequisites:
-    pip install requests
-    claude CLI must be installed and authenticated (uses claude --print for LLM calls).
+    wow_quests.json from export_quests.py in the working folder.
+    claude CLI installed and authenticated (uses claude --print for LLM calls).
 
-Run from the SideQuestsOnly addon directory:
-    python3 classify_quests.py
+Run from tools/:
+    python3 classify_quests.py --max-batches 50
+    python3 classify_quests.py --resume --max-batches 50   # until no chain is left
 
-Output files:
-    category_assignments.json   – per-quest category map (review before applying)
-    QuestData.lua               – regenerated with QC_QuestCategory (after review)
-    QuestData.lua.bak           – backup of the original
-    quest_chain_cache.json      – updated cache (additive: adds text fields)
+Output:
+    category_assignments.json   – per-chain and per-quest categories; review it,
+                                  then turn it into SQL with questdata_to_sql.py
 """
 
-import re, json, time, os, sys, shutil, argparse
+import re, json, time, os, sys, argparse
 from collections import defaultdict
-
-try:
-    import requests
-except ImportError:
-    sys.exit("pip install requests  (requests library not found)")
-
-try:
-    import anthropic as _anthropic
-except ImportError:
-    sys.exit("pip install anthropic  (anthropic library not found)")
-
-
-def _make_client():
-    """
-    Create an Anthropic client using Claude Code's own OAuth token
-    (CLAUDE_CODE_OAUTH_TOKEN + ANTHROPIC_BASE_URL), or fall back to
-    ANTHROPIC_API_KEY if set.
-    """
-    oauth   = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-
-    key = oauth or api_key
-    if not key:
-        sys.exit("No API credentials found. Set ANTHROPIC_API_KEY or run inside Claude Code.")
-
-    return _anthropic.Anthropic(api_key=key, base_url=base_url)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-WOWHEAD_BASE      = "https://wotlk.wowhead.com"
-RATE_LIMIT        = 0.5          # seconds between WoWHead HTTP requests
-CACHE_FILE        = "quest_chain_cache.json"
-DB_EXPORT_FILE    = "wow_quests.json"    # exported from acore_world via ssh
-LUA_FILE          = "QuestData.lua"
+DB_EXPORT_FILE    = "wow_quests.json"    # from export_quests.py
 ASSIGN_FILE       = "category_assignments.json"
 
-MODEL             = "claude-sonnet-4-6"  # via `claude --print` subprocess (full Pro access)
+MODEL             = "opus"       # claude --print --model (opus or sonnet)
 CHAINS_PER_BATCH  = 5            # quest chains per subprocess call (sonnet needs smaller batches)
 DESC_MAX_CHARS    = 180          # max chars of description / completion per quest
 OBJ_MAX_CHARS     = 120          # max chars of objectives per quest
@@ -265,133 +233,15 @@ PROFESSION_PATTERNS = (
     r"\b(recipe|pattern|formula|schematic|design|manual|plans):\b",
 )
 
-# WoW 3.3.5a zone area IDs (WoWHead uses these for zone filtering).
-# This list covers every major leveling zone from starting areas through Northrend.
-# If a zone scrape returns 0 quests the zone ID may be wrong — check the
-# WoWHead URL for that zone and update accordingly.
-ZONE_IDS = [
-    # ── Eastern Kingdoms ──────────────────────────────────────────────────────
-    1,    # Dun Morogh
-    2,    # Coldridge Valley (dwarf/gnome start)
-    3,    # Badlands
-    4,    # Blasted Lands
-    8,    # Swamp of Sorrows
-    9,    # Northshire (human starting valley)
-    10,   # Duskwood
-    11,   # Wetlands
-    12,   # Elwynn Forest
-    28,   # Western Plaguelands
-    33,   # Stranglethorn Vale
-    36,   # Alterac Mountains
-    40,   # Westfall
-    41,   # Deadwind Pass
-    44,   # Redridge Mountains
-    45,   # Arathi Highlands
-    46,   # Burning Steppes
-    48,   # Loch Modan
-    51,   # Searing Gorge
-    85,   # Tirisfal Glades
-    130,  # Silverpine Forest
-    139,  # Eastern Plaguelands
-    267,  # Hillsbrad Foothills
-    1497, # Undercity (city quests)
-    1537, # Ironforge (city quests)
-    3430, # Eversong Woods (blood elf starting zone)
-    3433, # Ghostlands
-    4080, # Isle of Quel'Danas
-    # ── Kalimdor ──────────────────────────────────────────────────────────────
-    5,    # Valley of Trials (orc / troll start)
-    14,   # Durotar
-    15,   # Dustwallow Marsh
-    16,   # Azshara
-    17,   # The Barrens
-    141,  # Teldrassil
-    148,  # Darkshore
-    214,  # Camp Narache (tauren start)
-    215,  # Mulgore
-    270,  # Shadowglen (night elf start)
-    331,  # Ashenvale
-    357,  # Feralas
-    361,  # Felwood
-    400,  # Thousand Needles
-    405,  # Desolace
-    406,  # Stonetalon Mountains
-    440,  # Tanaris
-    490,  # Un'Goro Crater
-    493,  # Moonglade
-    618,  # Winterspring
-    1377, # Silithus
-    1637, # Orgrimmar (city quests)
-    1638, # Thunder Bluff (city quests)
-    3524, # Azuremyst Isle (draenei start)
-    3949, # Bloodmyst Isle
-    # ── Outland ───────────────────────────────────────────────────────────────
-    3483, # Hellfire Peninsula
-    3518, # Nagrand
-    3519, # Terokkar Forest
-    3520, # Shadowmoon Valley
-    3521, # Zangarmarsh
-    3522, # Blade's Edge Mountains
-    3523, # Netherstorm
-    # ── Northrend ─────────────────────────────────────────────────────────────
-    65,   # Dragonblight
-    66,   # Zul'Drak
-    67,   # Storm Peaks
-    210,  # Icecrown
-    394,  # Grizzly Hills
-    495,  # Howling Fjord
-    2817, # Crystalsong Forest
-    3537, # Borean Tundra
-    3711, # Sholazar Basin
-    4197, # Wintergrasp
-    # ── Death Knight starting area ────────────────────────────────────────────
-    4298, # Ebon Hold / Death Knight starting experience
-]
-
-
-# ── Lua parser ────────────────────────────────────────────────────────────────
-
-def load_lua(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-def parse_main_quests(lua):
-    """Return {quest_id: zone_label} from existing QC_MainQuests."""
-    result = {}
-    for m in re.finditer(r'_m\[(\d+)\]\s*=\s*"([^"]+)"', lua):
-        result[int(m.group(1))] = m.group(2)
-    return result
-
-def parse_title_map(lua):
-    """Return {lowercase_title: quest_id} from existing QC_QuestTitles."""
-    result = {}
-    for m in re.finditer(r'_t\["([^"]+)"\]\s*=\s*(\d+)', lua):
-        result[m.group(1)] = int(m.group(2))
-    return result
-
-
-# ── Cache helpers ─────────────────────────────────────────────────────────────
-
-def load_cache(path):
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        return {int(k): v for k, v in raw.items()}
-    return {}
-
-def save_cache(path, cache):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({str(k): v for k, v in cache.items()}, f, indent=2)
-
 
 # ── DB export loader ──────────────────────────────────────────────────────────
 
-def load_db_export(path, cache):
+def load_db_export(path):
     """
-    Load quest data from a wow_quests.json export (from acore_world MySQL).
-    Populates / updates cache with text fields and chain links.
+    Load quest data from a wow_quests.json export (export_quests.py).
+    Returns ({quest_id: quest info}, {quest_id: zone name}).
 
-    DB field → cache field mapping:
+    DB field → quest info field mapping:
         title             ← LogTitle
         description       ← LogDescription   (quest log story text)
         details           ← QuestDescription (NPC dialog on accept)
@@ -400,7 +250,6 @@ def load_db_export(path, cache):
         objectives        ← ObjectiveText1
         objectives2-4     ← ObjectiveText2-4
         is_daily          ← Flags & 0x1000
-        is_dungeon        ← QuestSortID < 0  (negative sort = instance zone)
         quest_info_id     ← QuestInfoID  (41=PvP, 62/88/89=Raid, 81=Dungeon, 85=Heroic)
         prev_quest        ← PrevQuestID
         next_quest        ← NextQuestID
@@ -408,224 +257,40 @@ def load_db_export(path, cache):
         required_skill_id ← quest_template_addon.RequiredSkillID
         sort_id           ← QuestSortID
         starter_npc       ← creature_queststarter JOIN creature_template
+    The zone name is AreaTable.dbc's (QuestSortID > 0) or QuestSort.dbc's
+    (QuestSortID < 0) name for the quest's sort.
     """
-    if not os.path.exists(path):
-        print(f"  DB export not found: {path}")
-        return 0
-
     with open(path, "r", encoding="utf-8") as f:
         db_quests = json.load(f)
 
-    added = updated = 0
+    quests = {}
+    zone_labels = {}
     for q in db_quests:
         qid = q["id"]
-        flags        = q.get("flags", 0) or 0
-        sort_id      = q.get("sort_id", 0) or 0
-        quest_info_id = q.get("quest_info_id", 0) or 0
-        is_daily   = bool(flags & 0x1000)
-        is_dungeon = quest_info_id in (81, 85)  # 81=Dungeon, 85=Heroic; sort_id<0 is NOT reliable
-
-        entry = cache.get(qid, {"id": qid, "series": []})
-        is_new = qid not in cache
-
-        entry["title"]             = q.get("title")  or entry.get("title") or ""
-        entry["description"]       = (q.get("description")      or "")[:DESC_MAX_CHARS]
-        entry["details"]           = (q.get("details")          or "")[:DESC_MAX_CHARS]
-        entry["completion"]        = (q.get("completion")       or "")[:DESC_MAX_CHARS]
-        entry["area_description"]  = (q.get("area_description") or "")[:120]
-        entry["objectives"]        = (q.get("objectives")       or "")[:OBJ_MAX_CHARS]
-        entry["objectives2"]       = (q.get("objectives2")      or "")[:OBJ_MAX_CHARS]
-        entry["objectives3"]       = (q.get("objectives3")      or "")[:OBJ_MAX_CHARS]
-        entry["objectives4"]       = (q.get("objectives4")      or "")[:OBJ_MAX_CHARS]
-        entry["is_daily"]          = is_daily
-        entry["is_dungeon"]        = is_dungeon
-        entry["quest_info_id"]     = q.get("quest_info_id", 0) or 0
-        entry["sort_id"]           = sort_id
-        entry["prev_quest"]        = q.get("prev_quest", 0) or 0
-        entry["next_quest"]        = q.get("next_quest", 0) or 0
-        entry["allowable_classes"] = q.get("allowable_classes", 0) or 0
-        entry["required_skill_id"] = q.get("required_skill_id", 0) or 0
-        entry["starter_npc"]       = (q.get("starter_npc") or "")[:80]
-        cache[qid] = entry
-
-        if is_new:
-            added += 1
-        else:
-            updated += 1
-
-    return added, updated
-
-
-# ── WoWHead scraper ───────────────────────────────────────────────────────────
-
-def _extract_text_from_html(text, pattern_list):
-    """Try each regex pattern in order; return first non-empty stripped match."""
-    for pat in pattern_list:
-        m = re.search(pat, text, re.DOTALL | re.IGNORECASE)
-        if m:
-            raw = m.group(1)
-            clean = re.sub(r'<[^>]+>', ' ', raw)
-            clean = re.sub(r'\s+', ' ', clean).strip()
-            if clean:
-                return clean
-    return ""
-
-
-def scrape_quest_extended(quest_id, session):
-    """
-    Fetch the WoWHead WotLK page for quest_id and return an extended dict:
-        {
-            "id":          int,
-            "title":       str | None,
-            "series":      [int, ...],
-            "description": str,      # NPC intro text (up to DESC_MAX_CHARS)
-            "objectives":  str,      # objectives text (up to OBJ_MAX_CHARS)
-            "completion":  str,      # turn-in text (up to DESC_MAX_CHARS)
-            "is_daily":    bool,
-            "is_dungeon":  bool,
+        flags = q.get("flags", 0) or 0
+        quests[qid] = {
+            "id":                qid,
+            "title":             q.get("title") or "",
+            "description":       (q.get("description")      or "")[:DESC_MAX_CHARS],
+            "details":           (q.get("details")          or "")[:DESC_MAX_CHARS],
+            "completion":        (q.get("completion")       or "")[:DESC_MAX_CHARS],
+            "area_description":  (q.get("area_description") or "")[:120],
+            "objectives":        (q.get("objectives")       or "")[:OBJ_MAX_CHARS],
+            "objectives2":       (q.get("objectives2")      or "")[:OBJ_MAX_CHARS],
+            "objectives3":       (q.get("objectives3")      or "")[:OBJ_MAX_CHARS],
+            "objectives4":       (q.get("objectives4")      or "")[:OBJ_MAX_CHARS],
+            "is_daily":          bool(flags & 0x1000),
+            "quest_info_id":     q.get("quest_info_id", 0) or 0,
+            "sort_id":           q.get("sort_id", 0) or 0,
+            "prev_quest":        q.get("prev_quest", 0) or 0,
+            "next_quest":        q.get("next_quest", 0) or 0,
+            "allowable_classes": q.get("allowable_classes", 0) or 0,
+            "required_skill_id": q.get("required_skill_id", 0) or 0,
+            "starter_npc":       (q.get("starter_npc") or "")[:80],
         }
-    Returns None on network / non-200 error.
-    """
-    url = f"{WOWHEAD_BASE}/quest={quest_id}"
-    try:
-        r = session.get(url, timeout=20)
-    except requests.RequestException as e:
-        print(f"    network error for {quest_id}: {e}")
-        return None
-
-    if r.status_code == 404:
-        return {"id": quest_id, "title": None, "series": [],
-                "description": "", "objectives": "", "completion": "",
-                "is_daily": False, "is_dungeon": False}
-    if r.status_code != 200:
-        print(f"    HTTP {r.status_code} for quest {quest_id}")
-        return None
-
-    text = r.text
-
-    # ── Title ────────────────────────────────────────────────────────────────
-    title = None
-    tm = re.search(r'<title>([^<]+)</title>', text)
-    if tm:
-        raw = tm.group(1)
-        title = re.sub(r'\s*-\s*Quest\s*-.*$', '', raw, flags=re.IGNORECASE).strip()
-
-    # ── Series table ─────────────────────────────────────────────────────────
-    series = []
-    sm = re.search(r'<table class="series">(.*?)</table>', text, re.DOTALL)
-    if sm:
-        series = [int(x) for x in re.findall(r'/wotlk/quest=(\d+)/', sm.group(1))]
-
-    # ── Quest text from embedded JavaScript ──────────────────────────────────
-    # WoWHead embeds quest data as JSON in script tags. Multiple formats exist
-    # across their codebase versions; we try each in order.
-    description = ""
-    objectives  = ""
-    completion  = ""
-    is_daily    = False
-    is_dungeon  = False
-
-    # Pattern 1: WH.Gatherer.addData(1, N, {"QUESTID": {...}})
-    for pat in [
-        r'WH\.Gatherer\.addData\s*\(\s*1\s*,\s*\d+\s*,\s*(\{.*?\})\s*\)',
-        r'g_questData\s*=\s*(\{.*?\})\s*;',
-    ]:
-        m = re.search(pat, text, re.DOTALL)
-        if m:
-            try:
-                obj = json.loads(m.group(1))
-                qd  = obj.get(str(quest_id), {})
-                if not qd and isinstance(obj, dict):
-                    # Sometimes only one entry — take it if IDs match
-                    for v in obj.values():
-                        if isinstance(v, dict) and v.get("id") == quest_id:
-                            qd = v
-                            break
-                description = str(qd.get("Description", "") or "")[:DESC_MAX_CHARS]
-                objectives  = str(qd.get("Objectives", "")  or "")[:OBJ_MAX_CHARS]
-                completion  = str(qd.get("Completion", "")  or "")[:DESC_MAX_CHARS]
-                flags       = int(qd.get("flags", 0) or 0)
-                category    = int(qd.get("category", 0) or 0)
-                is_daily    = bool(flags & 0x1000)     # QUEST_FLAGS_DAILY
-                is_dungeon  = (category < 0)           # negative = instance zone
-                break
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
-
-    # Pattern 2: HTML fallback for description text
-    if not description:
-        description = _extract_text_from_html(text, [
-            r'id=["\']quest-description["\'][^>]*>(.*?)</div>',
-            r'class=["\']quest-detail-text["\'][^>]*>\s*<p>(.*?)</p>',
-        ])[:DESC_MAX_CHARS]
-
-    if not objectives:
-        objectives = _extract_text_from_html(text, [
-            r'id=["\']quest-objectives["\'][^>]*>(.*?)</div>',
-        ])[:OBJ_MAX_CHARS]
-
-    # Detect daily from page text if not caught via flags
-    if not is_daily:
-        is_daily = bool(re.search(r'daily quest|repeatable', text, re.IGNORECASE))
-
-    # Detect dungeon from page text if not caught via category
-    if not is_dungeon:
-        is_dungeon = bool(re.search(
-            r'class=["\'][^"\']*icon-dungeon|dungeon quest|instance quest', text,
-            re.IGNORECASE))
-
-    return {
-        "id":          quest_id,
-        "title":       title,
-        "series":      series,
-        "description": description,
-        "objectives":  objectives,
-        "completion":  completion,
-        "is_daily":    is_daily,
-        "is_dungeon":  is_dungeon,
-    }
-
-
-def scrape_zone_quest_ids(zone_id, session):
-    """
-    Scrape the quest list for a zone from WoWHead WotLK.
-    Returns a list of quest IDs found in the zone.
-    Returns [] on error or no results.
-    """
-    # WoWHead zone pages embed the quest list as a JavaScript Listview.
-    url = f"{WOWHEAD_BASE}/quests/zone:{zone_id}"
-    try:
-        r = session.get(url, timeout=20)
-    except requests.RequestException as e:
-        print(f"    network error for zone {zone_id}: {e}")
-        return []
-
-    if r.status_code != 200:
-        return []
-
-    text = r.text
-
-    # Extract quest IDs from Listview JS data
-    # Format: new Listview({template: 'quest', id: 'quests', ..., data: [{...}]})
-    ids = set()
-
-    # Method 1: extract from Listview data JSON
-    for m in re.finditer(
-            r"new Listview\s*\(\s*\{[^}]*?id\s*:\s*['\"]quests['\"][^}]*?data\s*:\s*(\[.*?\])\s*\}",
-            text, re.DOTALL):
-        try:
-            entries = json.loads(m.group(1))
-            for e in entries:
-                if isinstance(e, dict) and "id" in e:
-                    ids.add(int(e["id"]))
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
-
-    # Method 2: extract quest IDs from all quest links on the page
-    for qid_str in re.findall(r'/wotlk/quest=(\d+)/', text):
-        ids.add(int(qid_str))
-
-    return sorted(ids)
+        if q.get("zone"):
+            zone_labels[qid] = q["zone"]
+    return quests, zone_labels
 
 
 # ── Union-Find for chain grouping ─────────────────────────────────────────────
@@ -655,30 +320,25 @@ class UnionFind:
         return {k: sorted(v) for k, v in groups.items()}
 
 
-def build_chains(cache):
+def build_chains(quests):
     """
-    Use union-find to group quest IDs into chains.
-    Links come from WoWHead series arrays AND DB prev/next quest fields.
-    Returns {chain_root_id: [sorted list of quest IDs in chain]}.
+    Use union-find to group quest IDs into chains by their prev/next quest
+    links. Returns {chain_root_id: [sorted list of quest IDs in chain]}.
     """
     uf = UnionFind()
-    for qid, info in cache.items():
-        uf.find(qid)  # ensure every cached quest is registered
-        # WoWHead series links
-        for sibling in info.get("series", []):
-            if sibling > 0 and sibling in cache:
-                uf.union(qid, sibling)
-        # DB prev/next quest links (more reliable). Dungeon and raid quests
-        # join the open-world chain they belong to: the [Dungeon] / [Raid]
-        # tag is added per quest in Pass 3, so the chain shares one story.
+    for qid, info in quests.items():
+        uf.find(qid)  # ensure every quest is registered
+        # Dungeon and raid quests join the open-world chain they belong to:
+        # the [Dungeon] / [Raid] tag is added per quest in Pass 3, so the
+        # chain shares one story.
         for link_field in ("prev_quest", "next_quest"):
             linked = info.get(link_field, 0) or 0
-            if linked > 0 and linked in cache:
+            if linked > 0 and linked in quests:
                 uf.union(qid, linked)
     return uf.components()
 
 
-def is_profession_related(qid, cache):
+def is_profession_related(qid, quests):
     """Return True only on high-confidence profession signals.
 
     Uses sort_id (verified profession buckets) and required_skill_id (quest
@@ -686,7 +346,7 @@ def is_profession_related(qid, cache):
     removed because profession words appear in NPC dialogue/flavor text and
     produce too many false positives.  Ambiguous quests go to the LLM.
     """
-    info = cache.get(qid, {})
+    info = quests.get(qid, {})
     if (info.get("sort_id", 0) or 0) in PROFESSION_SORT_IDS:
         return True
     if (info.get("required_skill_id", 0) or 0) in PROFESSION_SKILL_IDS:
@@ -696,7 +356,7 @@ def is_profession_related(qid, cache):
 
 # ── Pass 1: rule-based classifier ─────────────────────────────────────────────
 
-def rule_category(qid, cache):
+def rule_category(qid, quests):
     """
     Category a quest gets from its own data, whatever chain it is in: attune,
     holiday, event, pvp, class or profession. None when the quest needs its
@@ -705,7 +365,7 @@ def rule_category(qid, cache):
     Priority: attune > holiday > event > pvp > class > profession.
     Holiday comes before pvp so Hallow's End pranks (typed PvP) stay holiday.
     """
-    info    = cache.get(qid, {})
+    info    = quests.get(qid, {})
     sort_id = info.get("sort_id", 0) or 0
     if qid in ATTUNE_QUEST_IDS:
         return "attune"
@@ -717,12 +377,12 @@ def rule_category(qid, cache):
         return "pvp"
     if sort_id in CLASS_SORT_IDS:
         return "class"
-    if is_profession_related(qid, cache):
+    if is_profession_related(qid, quests):
         return "profession"
     return None
 
 
-def narrative_overrides(chain_ids, cache):
+def narrative_overrides(chain_ids, quests):
     """
     Return {quest_id: "story"|"lore"|"side"} for the quests in a chain whose
     narrative was decided by hand (NARRATIVE_CHAIN_OVERRIDES, then
@@ -733,17 +393,17 @@ def narrative_overrides(chain_ids, cache):
             return {qid: category for qid in chain_ids}
     result = {}
     for qid in chain_ids:
-        sort_id = cache.get(qid, {}).get("sort_id", 0) or 0
+        sort_id = quests.get(qid, {}).get("sort_id", 0) or 0
         if sort_id in NARRATIVE_SORT_OVERRIDES:
             result[qid] = NARRATIVE_SORT_OVERRIDES[sort_id]
     return result
 
 
-def needs_llm(chain_ids, cache):
+def needs_llm(chain_ids, quests):
     """True when some quest in the chain has neither a rule category nor a
     hand-decided narrative, so the chain needs the LLM's story/lore/side."""
-    decided = narrative_overrides(chain_ids, cache)
-    return any(rule_category(q, cache) is None and q not in decided
+    decided = narrative_overrides(chain_ids, quests)
+    return any(rule_category(q, quests) is None and q not in decided
                for q in chain_ids)
 
 
@@ -872,7 +532,7 @@ Return ONLY valid JSON in exactly this format (no markdown, no explanation, just
 """
 
 
-def _build_chain_prompt_entry(chain_id, chain_ids, cache, zone_labels):
+def _build_chain_prompt_entry(chain_id, chain_ids, quests, zone_labels):
     """Format one chain's data for inclusion in the LLM prompt.
     All quests in the chain are included — no sampling cap."""
     lines = []
@@ -883,8 +543,8 @@ def _build_chain_prompt_entry(chain_id, chain_ids, cache, zone_labels):
 
     # Quest-giver NPC (first non-empty starter_npc in chain)
     starter = next(
-        (cache.get(q, {}).get("starter_npc") or "" for q in chain_ids
-         if (cache.get(q, {}).get("starter_npc") or "").strip()),
+        (quests.get(q, {}).get("starter_npc") or "" for q in chain_ids
+         if (quests.get(q, {}).get("starter_npc") or "").strip()),
         ""
     )
 
@@ -895,7 +555,7 @@ def _build_chain_prompt_entry(chain_id, chain_ids, cache, zone_labels):
     lines.append(f"Chain length: {len(chain_ids)} quest(s)")
 
     for i, qid in enumerate(chain_ids, 1):
-        info    = cache.get(qid, {})
+        info    = quests.get(qid, {})
         t       = info.get("title") or f"Quest #{qid}"
         desc    = (info.get("description")      or "").strip()
         details = (info.get("details")          or "").strip()
@@ -924,11 +584,9 @@ def _build_chain_prompt_entry(chain_id, chain_ids, cache, zone_labels):
     return "\n".join(lines)
 
 
-def classify_chains_llm(batch, cache, zone_labels, client=None):
+def classify_chains_llm(batch, quests, zone_labels):
     """
     Classify a batch of chains using `claude --print` subprocess.
-    Works with Claude Pro subscription (sonnet/opus available); no SDK rate limits.
-    client param is ignored (kept for signature compatibility).
     batch: list of (chain_id, chain_ids) tuples
     Returns {chain_id: "story"|"lore"|"side"|"profession"} dict.
     A chain the LLM did not answer for is left out, so it stays unclassified
@@ -942,7 +600,7 @@ def classify_chains_llm(batch, cache, zone_labels, client=None):
     # Build the user message listing all chains in this batch
     entries = []
     for chain_id, chain_ids in batch:
-        entries.append(_build_chain_prompt_entry(chain_id, chain_ids, cache, zone_labels))
+        entries.append(_build_chain_prompt_entry(chain_id, chain_ids, quests, zone_labels))
 
     user_content = (
         f"Classify these {len(batch)} quest chain(s). "
@@ -985,7 +643,8 @@ def classify_chains_llm(batch, cache, zone_labels, client=None):
             if attempt < 2:
                 time.sleep(5)
         except (json.JSONDecodeError, KeyError) as e:
-            print(f"    LLM parse error (attempt {attempt+1}): {e}")
+            print(f"    LLM parse error (attempt {attempt+1}): {e}; "
+                  f"reply: {result.stdout.strip()[:150]!r}")
             if attempt < 2:
                 time.sleep(2 ** attempt)
         except Exception as e:
@@ -1005,7 +664,7 @@ def is_raid(info):
             or (info.get("sort_id", 0) or 0) in RAID_SORT_IDS)
 
 
-def quest_category(qid, chain_category, overrides, cache):
+def quest_category(qid, chain_category, overrides, quests):
     """
     Final category of one quest. chain_category is the chain's story / lore /
     side / profession from the LLM (None if it has none); overrides is the
@@ -1016,13 +675,13 @@ def quest_category(qid, chain_category, overrides, cache):
     and an open-world daily becomes daily. Returns None when the quest has no
     category yet (its chain still needs the LLM).
     """
-    rule = rule_category(qid, cache)
+    rule = rule_category(qid, quests)
     if rule:
         return rule
     base = overrides.get(qid, chain_category)
     if base is None or base == "profession":
         return base
-    info = cache.get(qid, {})
+    info = quests.get(qid, {})
     if is_raid(info):
         return f"raid_{base}"
     if (info.get("quest_info_id", 0) or 0) in QUEST_INFO_DUNGEON:
@@ -1032,7 +691,7 @@ def quest_category(qid, chain_category, overrides, cache):
     return base
 
 
-# ── Lua writer ────────────────────────────────────────────────────────────────
+# ── Summary order ─────────────────────────────────────────────────────────────
 
 CATEGORY_ORDER = [
     "story", "lore", "attune", "class", "profession", "daily", "pvp", "holiday", "event",
@@ -1040,53 +699,10 @@ CATEGORY_ORDER = [
     "side",
 ]
 
-HEADER_TEMPLATE = """\
--- QuestClassification Quest Data
--- Generated by classify_quests.py
---
--- QC_QuestCategory[questID] = category string
--- Categories: story | lore | attune | class | profession | daily | pvp | holiday | event
---             dungeon_story | dungeon_lore | dungeon_side | raid_story | raid_lore | raid_side
---             side
---
--- A quest is absent from this table only when it was never classified —
--- the addon shows [?] in NPC dialogs for those quests.
-
--- QC_QuestCategory[questID] = "category"
-QC_QuestCategory = {}
-local _c = QC_QuestCategory
-"""
-
-def write_lua(path, quest_categories, title_map):
-    """Regenerate QuestData.lua with QC_QuestCategory."""
-    by_cat = defaultdict(list)
-    for qid, cat in quest_categories.items():
-        by_cat[cat].append(qid)
-
-    lines = [HEADER_TEMPLATE.rstrip()]
-    for cat in CATEGORY_ORDER:
-        if cat not in by_cat:
-            continue
-        lines.append(f"-- {cat.upper()}")
-        for qid in sorted(by_cat[cat]):
-            lines.append(f'_c[{qid}] = "{cat}"')
-        lines.append("")
-
-    lines.append("-- Quest title → ID lookup (lower-case keys)")
-    lines.append("QC_QuestTitles = {}")
-    lines.append("local _t = QC_QuestTitles")
-    for title, qid in sorted(title_map.items(), key=lambda kv: kv[0]):
-        safe = title.replace("\\", "\\\\").replace('"', '\\"')
-        lines.append(f'_t["{safe}"] = {qid}')
-    lines.append("")  # trailing newline
-
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines))
-
 
 # ── Assignments file ──────────────────────────────────────────────────────────
 
-def write_assignments(path, chains, llm_assignments, llm_done, cache, zone_labels):
+def write_assignments(path, chains, llm_assignments, llm_done, quests, zone_labels):
     """
     Write category_assignments.json and return {quest_id: category}.
 
@@ -1099,18 +715,18 @@ def write_assignments(path, chains, llm_assignments, llm_done, cache, zone_label
     quest_categories = {}
     out = {}
     for root, members in chains.items():
-        overrides = narrative_overrides(members, cache)
+        overrides = narrative_overrides(members, quests)
         chain_cat = llm_assignments.get(root)
-        cats = {q: quest_category(q, chain_cat, overrides, cache) for q in members}
+        cats = {q: quest_category(q, chain_cat, overrides, quests) for q in members}
         quest_categories.update({q: c for q, c in cats.items() if c})
         out[str(root)] = {
             "category": chain_cat,
             "chain_length": len(members),
             "quest_ids": members,
             "quest_categories": {str(q): c for q, c in cats.items()},
-            "titles": [cache.get(q, {}).get("title") or f"#{q}" for q in members[:5]],
+            "titles": [quests.get(q, {}).get("title") or f"#{q}" for q in members[:5]],
             "zone": next((zone_labels.get(q) for q in members if zone_labels.get(q)), None),
-            "needs_llm": needs_llm(members, cache),
+            "needs_llm": needs_llm(members, quests),
             "llm_done": root in llm_done,
         }
     with open(path, "w", encoding="utf-8") as f:
@@ -1124,15 +740,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="Classify WoW quests into the addon's quest categories using Claude.")
     parser.add_argument(
-        "--apply", action="store_true",
-        help="Write QuestData.lua after classification (default: only write JSON).")
-    parser.add_argument(
-        "--discover-zones", action="store_true",
-        help="Scrape zone quest lists to discover new quest IDs (slow).")
-    parser.add_argument(
-        "--skip-text-fetch", "--skip-db", action="store_true",
-        help="Skip loading quest text from the DB export (wow_quests.json).")
-    parser.add_argument(
         "--skip-llm", action="store_true",
         help="Skip LLM classification; chains that need it stay unclassified "
              "(useful for testing the rules).")
@@ -1140,86 +747,26 @@ def main():
         "--resume", action="store_true",
         help="Load existing category_assignments.json and only run the LLM on chains "
              "it has not classified yet. Use with --max-batches to make incremental "
-             "progress when the OAuth token expires mid-run.")
+             "progress across several runs.")
     parser.add_argument(
         "--max-batches", type=int, default=0,
         help="Stop LLM pass after this many batches (0 = unlimited). "
              "Use with --resume to make incremental progress across multiple runs.")
     args = parser.parse_args()
 
-    if not os.path.exists(LUA_FILE):
-        sys.exit(f"Cannot find {LUA_FILE} – run from the SideQuestsOnly directory.")
+    if not os.path.exists(DB_EXPORT_FILE):
+        sys.exit(f"Cannot find {DB_EXPORT_FILE}: write it with export_quests.py "
+                 "and run from the folder that holds it.")
 
-    # ── Load existing data ────────────────────────────────────────────────────
-    lua        = load_lua(LUA_FILE)
-    main_q     = parse_main_quests(lua)   # {id: zone_label} – existing classifications
-    title_map  = parse_title_map(lua)     # {title: id}
-    cache      = load_cache(CACHE_FILE)
-
-    print(f"Loaded  {len(main_q):,} main quests | {len(title_map):,} title entries")
-    print(f"Cache   {len(cache):,} entries pre-loaded from {CACHE_FILE}")
-
-    # Seed cache with every quest in QC_MainQuests that isn't cached yet.
-    # Also backfill titles into existing cache entries that still have empty titles —
-    # this happens when a previous run seeded entries before titles were available.
-    # Reverse-map title_map so we can pre-populate titles even without a WoWHead fetch.
-    # Using title="" (not None) so the text-fetch step won't skip them as 404s.
-    rev_title = {v: k for k, v in title_map.items()}  # {quest_id: lowercase_title}
-    seeded = 0
-    title_filled = 0
-    for qid in main_q:
-        if qid not in cache:
-            cache[qid] = {"id": qid, "title": rev_title.get(qid, ""), "series": []}
-            seeded += 1
-        elif not cache[qid].get("title") and qid in rev_title:
-            cache[qid]["title"] = rev_title[qid]
-            title_filled += 1
-    if seeded or title_filled:
-        save_cache(CACHE_FILE, cache)
-        if seeded:
-            print(f"Seeded  {seeded:,} quests from QC_MainQuests into cache.")
-        if title_filled:
-            print(f"Filled  {title_filled:,} missing titles from QC_QuestTitles.")
-    print()
-
-    # ── Zone discovery (optional) ─────────────────────────────────────────────
-    if args.discover_zones:
-        print("=== Zone Discovery ===")
-        new_from_zones = 0
-        for zone_id in ZONE_IDS:
-            print(f"  Zone {zone_id}...", end=" ", flush=True)
-            ids = scrape_zone_quest_ids(zone_id, session)
-            before = len(cache)
-            for qid in ids:
-                if qid not in cache:
-                    cache[qid] = {"id": qid, "title": None, "series": []}
-            added = len(cache) - before
-            new_from_zones += added
-            print(f"{len(ids)} quests ({added} new)")
-            time.sleep(RATE_LIMIT)
-        save_cache(CACHE_FILE, cache)
-        print(f"Zone discovery: {new_from_zones:,} new quest IDs added to cache.\n")
-
-    # ── Load quest text from DB export (replaces WoWHead scraping) ───────────
     print("=== Loading Quest Data from DB Export ===")
-    if not args.skip_text_fetch and os.path.exists(DB_EXPORT_FILE):
-        added, updated_count = load_db_export(DB_EXPORT_FILE, cache)
-        save_cache(CACHE_FILE, cache)
-        print(f"  DB export: {added:,} new quests added, {updated_count:,} updated.")
-        print(f"  Cache now has {len(cache):,} quests.\n")
-    elif args.skip_text_fetch:
-        print("  (--skip-db: skipping DB export load)\n")
-    else:
-        print(f"  {DB_EXPORT_FILE} not found — using existing cache only.")
-        print(f"  To regenerate: ssh nbtdwow and run the Python export script.\n")
+    quests, zone_labels = load_db_export(DB_EXPORT_FILE)
+    print(f"  {len(quests):,} quests from {DB_EXPORT_FILE}, "
+          f"{len(zone_labels):,} with a zone.\n")
 
     # ── Build chains ──────────────────────────────────────────────────────────
     print("=== Building Quest Chains ===")
-    chains = build_chains(cache)
-    print(f"  {len(chains):,} chains (components) across {len(cache):,} quests.")
-
-    # Build zone_labels: {quest_id: zone_label} from original QC_MainQuests
-    zone_labels = dict(main_q)
+    chains = build_chains(quests)
+    print(f"  {len(chains):,} chains (components) across {len(quests):,} quests.")
 
     # Warn about large chains
     large = [(root, members) for root, members in chains.items()
@@ -1227,7 +774,7 @@ def main():
     if large:
         print(f"  WARNING: {len(large)} chains have {LARGE_CHAIN_WARN}+ quests:")
         for root, members in sorted(large, key=lambda x: -len(x[1]))[:10]:
-            titles = [cache.get(q, {}).get("title") or f"#{q}" for q in members[:3]]
+            titles = [quests.get(q, {}).get("title") or f"#{q}" for q in members[:3]]
             print(f"    chain {root}: {len(members)} quests — {', '.join(titles)}...")
     print()
 
@@ -1236,9 +783,9 @@ def main():
     rule_counts = defaultdict(int)
     overridden = 0
     for root, members in chains.items():
-        overrides = narrative_overrides(members, cache)
+        overrides = narrative_overrides(members, quests)
         for qid in members:
-            cat = rule_category(qid, cache)
+            cat = rule_category(qid, quests)
             if cat:
                 rule_counts[cat] += 1
             elif qid in overrides:
@@ -1248,7 +795,7 @@ def main():
         print(f"  {cat:10s}: {n:,} quests")
     print(f"  {'by hand':10s}: {overridden:,} quests (NARRATIVE_*_OVERRIDES)")
     llm_chains = [(root, members) for root, members in chains.items()
-                  if needs_llm(members, cache)]
+                  if needs_llm(members, quests)]
     print(f"  → {len(llm_chains):,} chains need LLM classification.\n")
 
     # ── Pass 2: LLM classification ────────────────────────────────────────────
@@ -1282,8 +829,6 @@ def main():
         print(f"  Classifying {remaining:,} chains "
               f"(this run: up to {cap:,})...\n")
 
-        # Create one SDK client for the entire run
-        llm_client = _make_client()
         llm_counts = defaultdict(int)
         batches_done = 0
 
@@ -1301,7 +846,7 @@ def main():
                   f"({batch_start+1}–{min(batch_start+CHAINS_PER_BATCH, remaining)}"
                   f" of {remaining})...", end=" ", flush=True)
 
-            results = classify_chains_llm(batch, cache, zone_labels, client=llm_client)
+            results = classify_chains_llm(batch, quests, zone_labels)
             for root, _ in batch:
                 cat = results.get(str(root))
                 if cat:
@@ -1317,7 +862,7 @@ def main():
             # Save incremental progress every 5 batches so --resume can pick up
             if batches_done % 5 == 0:
                 write_assignments(ASSIGN_FILE, chains, llm_assignments, llm_done,
-                                  cache, zone_labels)
+                                  quests, zone_labels)
 
             # Small pause between subprocess calls
             time.sleep(1)
@@ -1330,7 +875,7 @@ def main():
     # ── Pass 3: per-quest categories, write category_assignments.json ─────────
     print("=== Pass 3: Quest Categories ===")
     quest_categories = write_assignments(ASSIGN_FILE, chains, llm_assignments, llm_done,
-                                         cache, zone_labels)
+                                         quests, zone_labels)
     print(f"✓  Written {ASSIGN_FILE}  ({len(chains):,} chains)")
     print( "   Review this file before turning it into SQL (tools/questdata_to_sql.py).")
     unclassified = [(root, members) for root, members in llm_chains if root not in llm_done]
@@ -1339,16 +884,6 @@ def main():
         print(f"  WARNING: {len(unclassified):,} chains ({n_quests:,} quests) still need "
               f"the LLM; run again with --resume.")
     print()
-
-    # ── Build extended title map ──────────────────────────────────────────────
-    # Include all classified quest titles (not just formerly-main quests)
-    extended_titles = dict(title_map)
-    for qid, info in cache.items():
-        t = info.get("title")
-        if t and qid in quest_categories:
-            key = t.lower()
-            if key not in extended_titles:
-                extended_titles[key] = qid
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("=== Classification Summary ===")
@@ -1363,20 +898,6 @@ def main():
         print(f"  {cat:14s}: {n:>6,} quests ({pct:.1f}%)")
     print(f"  {'TOTAL':10s}: {total_quests:>6,} quests")
     print()
-
-    # ── Optionally write QuestData.lua ────────────────────────────────────────
-    if args.apply:
-        shutil.copy2(LUA_FILE, LUA_FILE + ".bak")
-        print(f"Backup → {LUA_FILE}.bak")
-
-        write_lua(LUA_FILE, quest_categories, extended_titles)
-        print(f"✓  Written {LUA_FILE}:")
-        print(f"   QC_QuestCategory: {len(quest_categories):,} quests")
-        print(f"   QC_QuestTitles  : {len(extended_titles):,} titles")
-        print()
-        print("Done!  /reload in-game to apply the new quest categories.")
-    else:
-        print("Run with --apply to write QuestData.lua from these results.")
 
 
 if __name__ == "__main__":
