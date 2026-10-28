@@ -160,8 +160,8 @@ storyline and campaign pages and pre-Cataclysm WoWWiki pages as references.
   Knight start is story, the Argent Tournament's Black Knight chain and the dungeon set 2
   upgrade chain are lore, and the rest of the Tournament is side.
 
-The shipped SQL is still the classifier's 2026-03-27 run (`category_assignments.json`),
-from before these rules.
+The shipped SQL is the classifier's 2026-10-28 run with these rules, covering all
+9,536 quests.
 
 To run the classifier:
 
