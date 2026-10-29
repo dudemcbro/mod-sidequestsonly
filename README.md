@@ -78,7 +78,7 @@ Copy `client-addon/SideQuestsOnly/` into the client's `Interface/AddOns/` folder
 client. Remove any older SideQuestsOnly first: version 2 has no `QuestData.lua`, it gets
 everything from the server. Raid categories need addon 2.1.0 or later.
 
-On login the addon prints `SideQuestsOnly v2.1.0  9528 quests classified by the server.`
+On login the addon prints `SideQuestsOnly v2.1.0  9536 quests classified by the server.`
 If the server does not answer within 15 seconds it says so; `/sqo sync` asks again.
 
 ## Configuration
