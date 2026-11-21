@@ -1,6 +1,13 @@
 name: core-build
-# Manual only while the repository is private: each run is an hour-long core build.
 on:
+  push:
+    branches:
+      - 'master'
+      - 'main'
+  pull_request:
+    branches:
+      - 'master'
+      - 'main'
   workflow_dispatch:
 
 jobs:
